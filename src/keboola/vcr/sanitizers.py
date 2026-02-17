@@ -52,12 +52,17 @@ class DefaultSanitizer(BaseSanitizer):
     - _sanitize_url(): query params + exact value replacement
     - _sanitize_body(): tries JSON -> form-encoded -> exact value replacement
 
+    When ``config`` is provided (a Keboola config dict), all values under
+    ``#``-prefixed keys are automatically extracted and treated as sensitive
+    values — no separate ConfigSecretsSanitizer needed.
+
     Customization per component:
     - sensitive_fields: override default field names to redact
     - additional_sensitive_fields: extend defaults without replacing
     - sensitive_values: exact strings from secrets file
     - safe_headers: override default header whitelist
     - additional_safe_headers: extend default whitelist
+    - config: Keboola config dict for auto-detecting #-prefixed secrets
     """
 
     DEFAULT_SENSITIVE_FIELDS = [
@@ -78,6 +83,7 @@ class DefaultSanitizer(BaseSanitizer):
         safe_headers: Optional[List[str]] = None,
         additional_safe_headers: Optional[List[str]] = None,
         replacement: str = "REDACTED",
+        config: Optional[Dict[str, Any]] = None,
     ):
         # Build sensitive fields set
         if sensitive_fields is not None:
@@ -95,9 +101,14 @@ class DefaultSanitizer(BaseSanitizer):
         if additional_safe_headers:
             self.safe_headers.update(h.lower() for h in additional_safe_headers)
 
+        # Collect sensitive values: explicit + auto-detected from #-prefixed config keys
+        all_values = list(sensitive_values or [])
+        if config:
+            _walk_for_hash_keys(config, all_values)
+
         # Sort known values longest-first to prevent partial JWT replacement
         self.sensitive_values = sorted(
-            [v for v in (sensitive_values or []) if v],
+            [v for v in all_values if v],
             key=len, reverse=True,
         )
         self.replacement = replacement

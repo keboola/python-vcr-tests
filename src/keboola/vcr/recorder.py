@@ -376,7 +376,6 @@ class VCRRecorder:
     def record_debug_run(
         cls,
         component_runner: Callable[[], None],
-        secrets: Optional[Dict[str, Any]] = None,
         sanitizers: Optional[List["BaseSanitizer"]] = None,
     ) -> None:
         """
@@ -386,10 +385,13 @@ class VCRRecorder:
         suppresses verbose logging that leaks tokens, and records a cassette
         to /data/out/files/ for download as an artifact.
 
+        The default sanitizer chain always includes:
+        - ConfigSecretsSanitizer (auto-detects #-prefixed secrets from config.json)
+        - DefaultSanitizer (handles common sensitive fields)
+
         Args:
             component_runner: Callable that runs the component
-            secrets: Secret values to sanitize from recordings
-            sanitizers: Custom sanitizers to apply (uses defaults if None)
+            sanitizers: Additional sanitizers to extend the default chain
         """
         import os
         from datetime import datetime
@@ -404,10 +406,16 @@ class VCRRecorder:
         component_id = os.environ.get("KBC_COMPONENTID", "component").replace(".", "-")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        # Build sanitizer chain
+        config_path = Path(data_dir) / "config.json"
+        config = json.loads(config_path.read_text()) if config_path.exists() else None
+        chain: List[BaseSanitizer] = [DefaultSanitizer(config=config)]
+        if sanitizers:
+            chain.extend(sanitizers)
+
         recorder = cls(
             cassette_dir=output_dir,
-            secrets=secrets or {},
-            sanitizers=sanitizers,
+            sanitizers=chain,
             record_mode="all",
             freeze_time_at=None,
             cassette_file=f"vcr_debug_{component_id}_{config_id}_{timestamp}.json",
