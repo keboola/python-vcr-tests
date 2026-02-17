@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keboola.vcr"
+version = "0.1.0"
+description = "VCR recording, sanitization, and validation for Keboola component HTTP interactions"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "vcrpy>=4.0.0",
+    "freezegun>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/keboola/python-vcr-tests"
+Repository = "https://github.com/keboola/python-vcr-tests"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["keboola.vcr*"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v"

@@ -1,0 +1,829 @@
+"""
+Sanitizers for VCR cassettes.
+
+This module provides pluggable sanitization classes that can be used to
+redact sensitive information from recorded HTTP interactions.
+"""
+
+import json
+import re
+from abc import ABC
+from typing import Any, Dict, List, Optional
+
+
+class BaseSanitizer(ABC):
+    """
+    Base class for request/response sanitization.
+
+    Subclass this to create custom sanitizers that can modify
+    requests and responses before they are recorded to cassettes.
+    """
+
+    def before_record_request(self, request: Any) -> Any:
+        """
+        Sanitize request before recording. Override in subclass.
+
+        Args:
+            request: The vcrpy request object
+
+        Returns:
+            The sanitized request object
+        """
+        return request
+
+    def before_record_response(self, response: Dict) -> Dict:
+        """
+        Sanitize response before recording. Override in subclass.
+
+        Args:
+            response: The vcrpy response dictionary
+
+        Returns:
+            The sanitized response dictionary
+        """
+        return response
+
+
+class DefaultSanitizer(BaseSanitizer):
+    """
+    Smart unified sanitizer for VCR cassettes.
+
+    Two core functions applied to all HTTP interactions:
+    - _sanitize_url(): query params + exact value replacement
+    - _sanitize_body(): tries JSON -> form-encoded -> exact value replacement
+
+    Customization per component:
+    - sensitive_fields: override default field names to redact
+    - additional_sensitive_fields: extend defaults without replacing
+    - sensitive_values: exact strings from secrets file
+    - safe_headers: override default header whitelist
+    - additional_safe_headers: extend default whitelist
+    """
+
+    DEFAULT_SENSITIVE_FIELDS = [
+        "access_token", "refresh_token", "id_token",
+        "client_id", "client_secret", "client_assertion",
+        "code", "password", "token",
+    ]
+
+    DEFAULT_SAFE_HEADERS = [
+        "content-type", "content-length", "accept",
+    ]
+
+    def __init__(
+        self,
+        sensitive_fields: Optional[List[str]] = None,
+        additional_sensitive_fields: Optional[List[str]] = None,
+        sensitive_values: Optional[List[str]] = None,
+        safe_headers: Optional[List[str]] = None,
+        additional_safe_headers: Optional[List[str]] = None,
+        replacement: str = "REDACTED",
+    ):
+        # Build sensitive fields set
+        if sensitive_fields is not None:
+            self.sensitive_fields = set(sensitive_fields)
+        else:
+            self.sensitive_fields = set(self.DEFAULT_SENSITIVE_FIELDS)
+        if additional_sensitive_fields:
+            self.sensitive_fields.update(additional_sensitive_fields)
+
+        # Build header whitelist
+        if safe_headers is not None:
+            self.safe_headers = set(h.lower() for h in safe_headers)
+        else:
+            self.safe_headers = set(h.lower() for h in self.DEFAULT_SAFE_HEADERS)
+        if additional_safe_headers:
+            self.safe_headers.update(h.lower() for h in additional_safe_headers)
+
+        # Sort known values longest-first to prevent partial JWT replacement
+        self.sensitive_values = sorted(
+            [v for v in (sensitive_values or []) if v],
+            key=len, reverse=True,
+        )
+        self.replacement = replacement
+        # Pre-compile regex for form-encoded/query param matching
+        self._field_patterns = [
+            re.compile(rf'({re.escape(f)}=)[^&"\s]+')
+            for f in self.sensitive_fields
+        ]
+
+    # -- Core function 1: URL sanitization --
+
+    def _sanitize_url(self, url: str) -> str:
+        """Sanitize query params by field name, then replace known secret values."""
+        result = url
+        for pattern in self._field_patterns:
+            result = pattern.sub(rf'\1{self.replacement}', result)
+        for value in self.sensitive_values:
+            if value in result:
+                result = result.replace(value, self.replacement)
+        return result
+
+    # -- Core function 2: Body sanitization --
+
+    def _sanitize_body(self, body: str) -> str:
+        """Sanitize body: try JSON -> form-encoded -> exact value replacement."""
+        if not body:
+            return body
+
+        # 1. Try JSON
+        try:
+            data = json.loads(body)
+            sanitized = self._sanitize_json_value(data)
+            return json.dumps(sanitized)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        # 2. Try form-encoded param patterns (same regex as URL)
+        result = body
+        for pattern in self._field_patterns:
+            result = pattern.sub(rf'\1{self.replacement}', result)
+
+        # 3. Always do exact value replacement as catch-all
+        for value in self.sensitive_values:
+            if value in result:
+                result = result.replace(value, self.replacement)
+        return result
+
+    def _sanitize_json_value(self, data: Any) -> Any:
+        """Recursively sanitize JSON data by field name and known values."""
+        if isinstance(data, dict):
+            result = {}
+            for key, value in data.items():
+                if key in self.sensitive_fields:
+                    result[key] = self.replacement
+                else:
+                    result[key] = self._sanitize_json_value(value)
+            return result
+        elif isinstance(data, list):
+            return [self._sanitize_json_value(item) for item in data]
+        elif isinstance(data, str):
+            # Replace known secret values in string fields (catches embedded tokens)
+            result = data
+            for value in self.sensitive_values:
+                if value in result:
+                    result = result.replace(value, self.replacement)
+            return result
+        return data
+
+    # -- Header filtering --
+
+    def _filter_headers(self, headers: Dict) -> Dict:
+        """Whitelist-only header filtering."""
+        result = {}
+        for key, value in headers.items():
+            if key.lower() in self.safe_headers:
+                result[key] = value
+        return result
+
+    # -- Applied uniformly to requests and responses --
+
+    def before_record_request(self, request: Any) -> Any:
+        """Sanitize URL, headers, and body of request."""
+        if hasattr(request, "uri"):
+            request.uri = self._sanitize_url(request.uri)
+
+        if hasattr(request, "headers"):
+            request.headers = self._filter_headers(request.headers)
+
+        if hasattr(request, "body") and request.body:
+            if isinstance(request.body, bytes):
+                body_str = request.body.decode("utf-8", errors="ignore")
+                request.body = self._sanitize_body(body_str).encode("utf-8")
+            elif isinstance(request.body, str):
+                request.body = self._sanitize_body(request.body)
+
+        return request
+
+    def before_record_response(self, response: Dict) -> Dict:
+        """Sanitize headers and body of response."""
+        if "headers" in response:
+            response["headers"] = self._filter_headers(response["headers"])
+
+        if "body" in response:
+            body = response["body"]
+            if isinstance(body, dict) and "string" in body:
+                if isinstance(body["string"], bytes):
+                    body_str = body["string"].decode("utf-8", errors="ignore")
+                    body["string"] = self._sanitize_body(body_str).encode("utf-8")
+                elif isinstance(body["string"], str):
+                    body["string"] = self._sanitize_body(body["string"])
+
+        return response
+
+
+class TokenSanitizer(BaseSanitizer):
+    """
+    Replaces auth tokens and secrets with placeholders.
+
+    Searches through request URIs, headers, and body for the specified
+    tokens and replaces them with the replacement string.
+    """
+
+    def __init__(self, tokens: List[str], replacement: str = "REDACTED"):
+        """
+        Args:
+            tokens: List of token values to sanitize
+            replacement: Replacement string for tokens
+        """
+        self.tokens = [t for t in tokens if t]  # Filter out empty strings
+        self.replacement = replacement
+
+    def _sanitize_string(self, value: str) -> str:
+        """Replace all tokens in a string."""
+        result = value
+        for token in self.tokens:
+            if token and token in result:
+                result = result.replace(token, self.replacement)
+        return result
+
+    def _sanitize_dict(self, d: Dict) -> Dict:
+        """Recursively sanitize all string values in a dictionary."""
+        result = {}
+        for key, value in d.items():
+            if isinstance(value, str):
+                result[key] = self._sanitize_string(value)
+            elif isinstance(value, dict):
+                result[key] = self._sanitize_dict(value)
+            elif isinstance(value, list):
+                result[key] = self._sanitize_list(value)
+            else:
+                result[key] = value
+        return result
+
+    def _sanitize_list(self, lst: List) -> List:
+        """Recursively sanitize all items in a list."""
+        result = []
+        for item in lst:
+            if isinstance(item, str):
+                result.append(self._sanitize_string(item))
+            elif isinstance(item, dict):
+                result.append(self._sanitize_dict(item))
+            elif isinstance(item, list):
+                result.append(self._sanitize_list(item))
+            else:
+                result.append(item)
+        return result
+
+    def before_record_request(self, request: Any) -> Any:
+        """Sanitize tokens in request URI, headers, and body."""
+        # Sanitize URI
+        if hasattr(request, "uri"):
+            request.uri = self._sanitize_string(request.uri)
+
+        # Sanitize headers
+        if hasattr(request, "headers"):
+            for header_name in list(request.headers.keys()):
+                values = request.headers.get(header_name, [])
+                if isinstance(values, list):
+                    request.headers[header_name] = [
+                        self._sanitize_string(v) if isinstance(v, str) else v for v in values
+                    ]
+                elif isinstance(values, str):
+                    request.headers[header_name] = self._sanitize_string(values)
+
+        # Sanitize body
+        if hasattr(request, "body") and request.body:
+            if isinstance(request.body, str):
+                request.body = self._sanitize_string(request.body)
+            elif isinstance(request.body, bytes):
+                body_str = request.body.decode("utf-8", errors="ignore")
+                sanitized = self._sanitize_string(body_str)
+                request.body = sanitized.encode("utf-8")
+
+        return request
+
+    def before_record_response(self, response: Dict) -> Dict:
+        """Sanitize tokens in response body and headers."""
+        if "body" in response:
+            body = response["body"]
+            if isinstance(body, dict) and "string" in body:
+                if isinstance(body["string"], str):
+                    body["string"] = self._sanitize_string(body["string"])
+                elif isinstance(body["string"], bytes):
+                    body_str = body["string"].decode("utf-8", errors="ignore")
+                    body["string"] = self._sanitize_string(body_str).encode("utf-8")
+
+        if "headers" in response:
+            response["headers"] = self._sanitize_dict(response["headers"])
+
+        return response
+
+
+class HeaderSanitizer(BaseSanitizer):
+    """
+    Filters headers to whitelist only safe ones.
+
+    Removes potentially sensitive headers from requests and responses,
+    keeping only those in the whitelist.
+    """
+
+    # Default safe headers that don't contain sensitive info
+    DEFAULT_SAFE_HEADERS = [
+        "content-type",
+        "content-length",
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "cache-control",
+        "connection",
+        "host",
+        "user-agent",
+        "date",
+        "server",
+        "transfer-encoding",
+        "vary",
+        "x-request-id",
+        "x-correlation-id",
+    ]
+
+    def __init__(
+        self,
+        safe_headers: Optional[List[str]] = None,
+        additional_safe_headers: Optional[List[str]] = None,
+        headers_to_remove: Optional[List[str]] = None,
+    ):
+        """
+        Args:
+            safe_headers: Complete list of headers to keep (overrides defaults)
+            additional_safe_headers: Headers to add to the default safe list
+            headers_to_remove: Specific headers to always remove
+        """
+        if safe_headers is not None:
+            self.safe_headers = set(h.lower() for h in safe_headers)
+        else:
+            self.safe_headers = set(h.lower() for h in self.DEFAULT_SAFE_HEADERS)
+            if additional_safe_headers:
+                self.safe_headers.update(h.lower() for h in additional_safe_headers)
+
+        self.headers_to_remove = set(h.lower() for h in (headers_to_remove or []))
+
+    def _filter_headers(self, headers: Dict) -> Dict:
+        """Filter headers to only include safe ones."""
+        result = {}
+        for key, value in headers.items():
+            key_lower = key.lower()
+            if key_lower in self.headers_to_remove:
+                continue
+            if key_lower in self.safe_headers:
+                result[key] = value
+        return result
+
+    def before_record_request(self, request: Any) -> Any:
+        """Remove non-safe headers from request."""
+        if hasattr(request, "headers"):
+            request.headers = self._filter_headers(request.headers)
+        return request
+
+    def before_record_response(self, response: Dict) -> Dict:
+        """Remove non-safe headers from response."""
+        if "headers" in response:
+            response["headers"] = self._filter_headers(response["headers"])
+        return response
+
+
+class UrlPatternSanitizer(BaseSanitizer):
+    """
+    Sanitizes URL patterns using regex replacement.
+
+    Useful for redacting dynamic IDs, account numbers, or other
+    sensitive data embedded in URLs.
+    """
+
+    def __init__(self, patterns: List[tuple]):
+        """
+        Args:
+            patterns: List of (pattern, replacement) tuples.
+                      Pattern is a regex string, replacement is the string
+                      to use for matches.
+        """
+        self.patterns = [(re.compile(p), r) for p, r in patterns]
+
+    def _sanitize_url(self, url: str) -> str:
+        """Apply all patterns to the URL."""
+        result = url
+        for pattern, replacement in self.patterns:
+            result = pattern.sub(replacement, result)
+        return result
+
+    def before_record_request(self, request: Any) -> Any:
+        """Sanitize URL patterns in request URI."""
+        if hasattr(request, "uri"):
+            request.uri = self._sanitize_url(request.uri)
+        return request
+
+
+class BodyFieldSanitizer(BaseSanitizer):
+    """
+    Sanitizes specific fields in JSON request/response bodies.
+
+    Useful for redacting specific known fields while preserving
+    the overall structure of the data.
+    """
+
+    def __init__(
+        self,
+        fields: List[str],
+        replacement: str = "REDACTED",
+        nested: bool = True,
+    ):
+        """
+        Args:
+            fields: List of field names to sanitize
+            replacement: Replacement value for the fields
+            nested: Whether to search nested dictionaries
+        """
+        self.fields = set(fields)
+        self.replacement = replacement
+        self.nested = nested
+
+    def _sanitize_dict(self, d: Dict) -> Dict:
+        """Sanitize specified fields in a dictionary."""
+        result = {}
+        for key, value in d.items():
+            if key in self.fields:
+                result[key] = self.replacement
+            elif self.nested and isinstance(value, dict):
+                result[key] = self._sanitize_dict(value)
+            elif self.nested and isinstance(value, list):
+                result[key] = [self._sanitize_dict(item) if isinstance(item, dict) else item for item in value]
+            else:
+                result[key] = value
+        return result
+
+    def _sanitize_body(self, body: Any) -> Any:
+        """Parse and sanitize JSON body."""
+        import json
+
+        if not body:
+            return body
+
+        try:
+            if isinstance(body, bytes):
+                data = json.loads(body.decode("utf-8"))
+                sanitized = self._sanitize_dict(data)
+                return json.dumps(sanitized).encode("utf-8")
+            elif isinstance(body, str):
+                data = json.loads(body)
+                sanitized = self._sanitize_dict(data)
+                return json.dumps(sanitized)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+        return body
+
+    def before_record_request(self, request: Any) -> Any:
+        """Sanitize fields in request body."""
+        if hasattr(request, "body") and request.body:
+            request.body = self._sanitize_body(request.body)
+        return request
+
+    def before_record_response(self, response: Dict) -> Dict:
+        """Sanitize fields in response body."""
+        if "body" in response:
+            body = response["body"]
+            if isinstance(body, dict) and "string" in body:
+                body["string"] = self._sanitize_body(body["string"])
+        return response
+
+
+class QueryParameterTokenSanitizer(BaseSanitizer):
+    """
+    Replaces URL query parameter values with a placeholder.
+
+    Unlike TokenSanitizer which requires knowing the exact token values,
+    this sanitizer replaces ANY value of specified query parameters.
+    This catches runtime-acquired tokens (e.g. Facebook page tokens)
+    that aren't known at recording time.
+
+    Example:
+        sanitizer = QueryParameterTokenSanitizer(
+            parameters=["access_token"], replacement="token"
+        )
+        # "...?access_token=EAACh5tPbZAJEB..." -> "...?access_token=token..."
+    """
+
+    def __init__(self, parameters: List[str] = None, replacement: str = "token"):
+        self.parameters = parameters or ["access_token"]
+        self.replacement = replacement
+        # Build regex patterns for each parameter
+        self._patterns = [
+            re.compile(rf'({re.escape(param)}=)[^&"\s]+')
+            for param in self.parameters
+        ]
+
+    def _sanitize_string(self, value: str) -> str:
+        """Replace parameter values in a string."""
+        for pattern in self._patterns:
+            value = pattern.sub(rf'\1{self.replacement}', value)
+        return value
+
+    def before_record_request(self, request: Any) -> Any:
+        """Sanitize query parameters in request URI."""
+        if hasattr(request, "uri"):
+            request.uri = self._sanitize_string(request.uri)
+        return request
+
+    def before_record_response(self, response: Dict) -> Dict:
+        """Sanitize query parameters in response body strings."""
+        if "body" in response:
+            body = response["body"]
+            if isinstance(body, dict) and "string" in body:
+                if isinstance(body["string"], str):
+                    body["string"] = self._sanitize_string(body["string"])
+                elif isinstance(body["string"], bytes):
+                    body_str = body["string"].decode("utf-8", errors="ignore")
+                    body["string"] = self._sanitize_string(body_str).encode("utf-8")
+        return response
+
+
+class ResponseUrlSanitizer(BaseSanitizer):
+    """
+    Sanitizes dynamic query parameters from URLs in response bodies.
+
+    Useful for CDN URLs (e.g. Facebook, Instagram) that contain ephemeral
+    query parameters which change between requests, causing cassette
+    mismatches during VCR replay.
+
+    Only processes responses whose body contains at least one of the
+    specified domains — skips all others without JSON re-serialization
+    to avoid data corruption during cassette loading.
+
+    Example:
+        sanitizer = ResponseUrlSanitizer(
+            dynamic_params=["_nc_gid", "_nc_ohc", "oh", "oe"],
+            url_domains=["fbcdn.net", "cdninstagram.com"],
+        )
+    """
+
+    def __init__(self, dynamic_params: List[str], url_domains: List[str]):
+        """
+        Args:
+            dynamic_params: Query parameter names to strip from matching URLs.
+            url_domains: Domain substrings that identify URLs to sanitize.
+        """
+        self.url_domains = url_domains
+        # Build a single regex that matches any of the dynamic params as
+        # query-string key=value pairs (including leading & or ?).
+        param_alts = "|".join(re.escape(p) for p in dynamic_params)
+        # Matches ?param=value or &param=value  (value = everything up to next & or quote/whitespace)
+        self._param_re = re.compile(rf'[?&](?:{param_alts})=[^&"\s]*')
+
+    def _body_has_matching_domain(self, body_str: str) -> bool:
+        """Quick check whether the body contains any target domain."""
+        return any(domain in body_str for domain in self.url_domains)
+
+    def _sanitize_url(self, url: str) -> str:
+        """Strip dynamic params from a single URL."""
+        sanitized = self._param_re.sub("", url)
+        # If we removed the first param (was prefixed with ?) the next param
+        # now starts with & but should start with ? — fix that.
+        if "?" not in sanitized and "&" in sanitized:
+            sanitized = sanitized.replace("&", "?", 1)
+        return sanitized
+
+    def _sanitize_body_string(self, body_str: str) -> str:
+        """Find URLs matching target domains and strip dynamic params."""
+        if not self._body_has_matching_domain(body_str):
+            return body_str
+
+        # Match URLs containing any of the target domains
+        domain_alts = "|".join(re.escape(d) for d in self.url_domains)
+        url_re = re.compile(rf'https?://[^\s"\'<>]*(?:{domain_alts})[^\s"\'<>]*')
+        return url_re.sub(lambda m: self._sanitize_url(m.group(0)), body_str)
+
+    def before_record_response(self, response: Dict) -> Dict:
+        """Sanitize CDN URLs in response body strings."""
+        if "body" not in response:
+            return response
+        body = response["body"]
+        if not isinstance(body, dict) or "string" not in body:
+            return response
+
+        if isinstance(body["string"], str):
+            if not self._body_has_matching_domain(body["string"]):
+                return response
+            body["string"] = self._sanitize_body_string(body["string"])
+        elif isinstance(body["string"], bytes):
+            try:
+                decoded = body["string"].decode("utf-8", errors="ignore")
+            except Exception:
+                return response
+            if not self._body_has_matching_domain(decoded):
+                return response
+            body["string"] = self._sanitize_body_string(decoded).encode("utf-8")
+
+        return response
+
+
+class CallbackSanitizer(BaseSanitizer):
+    """
+    Wraps raw callback functions as a sanitizer.
+
+    Allows components to provide custom sanitization logic
+    without subclassing BaseSanitizer.
+    """
+
+    def __init__(self, before_request=None, before_response=None):
+        self._before_request = before_request
+        self._before_response = before_response
+
+    def before_record_request(self, request):
+        if self._before_request:
+            return self._before_request(request)
+        return request
+
+    def before_record_response(self, response):
+        if self._before_response:
+            return self._before_response(response)
+        return response
+
+
+class CompositeSanitizer(BaseSanitizer):
+    """
+    Combines multiple sanitizers into a single sanitizer.
+
+    Sanitizers are applied in the order they are provided.
+    """
+
+    def __init__(self, sanitizers: List[BaseSanitizer]):
+        """
+        Args:
+            sanitizers: List of sanitizers to apply in order
+        """
+        self.sanitizers = sanitizers
+
+    def before_record_request(self, request: Any) -> Any:
+        """Apply all sanitizers to the request."""
+        for sanitizer in self.sanitizers:
+            request = sanitizer.before_record_request(request)
+        return request
+
+    def before_record_response(self, response: Dict) -> Dict:
+        """Apply all sanitizers to the response."""
+        for sanitizer in self.sanitizers:
+            response = sanitizer.before_record_response(response)
+        return response
+
+
+class ConfigSecretsSanitizer(BaseSanitizer):
+    """
+    Auto-sanitizer for Keboola encrypted config parameters.
+
+    Reads a config dict, finds all parameter values whose keys start with '#'
+    (Keboola encrypted fields), and replaces those values wherever they appear
+    in requests/responses. This is always added to the default sanitizer chain
+    so that secrets are never leaked into cassettes.
+
+    Usage:
+        # Auto-detect from config file:
+        sanitizer = ConfigSecretsSanitizer.from_config_file(data_dir / "config.json")
+
+        # Or provide config dict directly:
+        sanitizer = ConfigSecretsSanitizer(config=config_dict)
+    """
+
+    def __init__(self, config: Dict[str, Any], replacement: str = "REDACTED"):
+        self.replacement = replacement
+        self.secret_values = self._extract_hash_secrets(config)
+
+    @classmethod
+    def from_config_file(cls, config_path, **kwargs) -> "ConfigSecretsSanitizer":
+        """Load config.json and auto-detect #-prefixed secrets."""
+        from pathlib import Path
+
+        config_path = Path(config_path)
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        return cls(config=config, **kwargs)
+
+    @staticmethod
+    def _extract_hash_secrets(config: Dict[str, Any]) -> List[str]:
+        """Recursively find all values under #-prefixed keys."""
+        secrets: List[str] = []
+        _walk_for_hash_keys(config, secrets)
+        # Sort longest-first to prevent partial replacements
+        return sorted(set(s for s in secrets if s), key=len, reverse=True)
+
+    def _sanitize_string(self, value: str) -> str:
+        """Replace all secret values in a string."""
+        result = value
+        for secret in self.secret_values:
+            if secret in result:
+                result = result.replace(secret, self.replacement)
+        return result
+
+    def before_record_request(self, request: Any) -> Any:
+        """Replace secret values in URI, headers, body."""
+        if hasattr(request, "uri"):
+            request.uri = self._sanitize_string(request.uri)
+
+        if hasattr(request, "headers"):
+            for header_name in list(request.headers.keys()):
+                values = request.headers.get(header_name, [])
+                if isinstance(values, list):
+                    request.headers[header_name] = [
+                        self._sanitize_string(v) if isinstance(v, str) else v for v in values
+                    ]
+                elif isinstance(values, str):
+                    request.headers[header_name] = self._sanitize_string(values)
+
+        if hasattr(request, "body") and request.body:
+            if isinstance(request.body, bytes):
+                body_str = request.body.decode("utf-8", errors="ignore")
+                request.body = self._sanitize_string(body_str).encode("utf-8")
+            elif isinstance(request.body, str):
+                request.body = self._sanitize_string(request.body)
+
+        return request
+
+    def before_record_response(self, response: Dict) -> Dict:
+        """Replace secret values in response body."""
+        if "body" in response:
+            body = response["body"]
+            if isinstance(body, dict) and "string" in body:
+                if isinstance(body["string"], str):
+                    body["string"] = self._sanitize_string(body["string"])
+                elif isinstance(body["string"], bytes):
+                    body_str = body["string"].decode("utf-8", errors="ignore")
+                    body["string"] = self._sanitize_string(body_str).encode("utf-8")
+
+        return response
+
+
+def _walk_for_hash_keys(obj: Any, secrets: List[str]) -> None:
+    """Recursively walk a dict/list and collect values under #-prefixed keys."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(key, str) and key.startswith("#"):
+                # Collect all string values under this key
+                _collect_strings(value, secrets)
+            else:
+                _walk_for_hash_keys(value, secrets)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_for_hash_keys(item, secrets)
+
+
+def _collect_strings(obj: Any, strings: List[str]) -> None:
+    """Collect all string values from a nested structure."""
+    if isinstance(obj, str) and obj:
+        strings.append(obj)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _collect_strings(value, strings)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_strings(item, strings)
+
+
+def extract_values(d: Dict, values: List[str]) -> List[str]:
+    """
+    Extract all string values from a dictionary recursively.
+
+    If a string value is valid JSON, parse it and extract inner values too.
+    Results are sorted longest-first to prevent partial replacements.
+    """
+    for key, value in d.items():
+        if isinstance(value, str) and value:
+            values.append(value)
+            # If the string is JSON, parse and extract inner values
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, dict):
+                    extract_values(parsed, values)
+                elif isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, str) and item:
+                            values.append(item)
+                        elif isinstance(item, dict):
+                            extract_values(item, values)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        elif isinstance(value, dict):
+            extract_values(value, values)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item:
+                    values.append(item)
+                elif isinstance(item, dict):
+                    extract_values(item, values)
+    return values
+
+
+def create_default_sanitizer(secrets: Dict[str, Any]) -> DefaultSanitizer:
+    """
+    Create a default sanitizer from secrets.
+
+    Extracts all string values from the secrets dict and returns a
+    DefaultSanitizer that handles OAuth bodies, JSON responses, headers,
+    and URL parameters automatically.
+
+    Args:
+        secrets: Dictionary of secret values to redact
+
+    Returns:
+        A DefaultSanitizer with extracted secret values
+    """
+    secret_values = extract_values(secrets, [])
+    return DefaultSanitizer(sensitive_values=secret_values)
