@@ -1,0 +1,4 @@
+[flake8]
+max-line-length = 120
+# E203: whitespace before ':' — false positive for ruff/black slice formatting (PEP 8 § Whitespace in Expressions)
+extend-ignore = E203

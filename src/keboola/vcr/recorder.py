@@ -6,15 +6,22 @@ HTTP interactions during component execution and replaying them
 for deterministic testing.
 """
 
+from __future__ import annotations
+
+import base64
 import json
 import logging
+import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable
 
 try:
     import vcr
+    from vcr.stubs import VCRHTTPResponse as _VCRHTTPResponse
 except ImportError:
     vcr = None  # type: ignore
+    _VCRHTTPResponse = None  # type: ignore
 
 try:
     from freezegun import freeze_time
@@ -129,8 +136,6 @@ class _BytesEncoder(json.JSONEncoder):
             try:
                 return obj.decode("utf-8")
             except UnicodeDecodeError:
-                import base64
-
                 return base64.b64encode(obj).decode("ascii")
         return super().default(obj)
 
@@ -178,11 +183,11 @@ class VCRRecorder:
     def __init__(
         self,
         cassette_dir: Path,
-        secrets: Optional[Dict[str, Any]] = None,
-        sanitizers: Optional[List[BaseSanitizer]] = None,
-        freeze_time_at: Optional[str] = "auto",
+        secrets: dict[str, Any] | None = None,
+        sanitizers: list[BaseSanitizer] | None = None,
+        freeze_time_at: str | None = "auto",
         record_mode: str = "new_episodes",
-        match_on: Optional[List[str]] = None,
+        match_on: list[str] | None = None,
         cassette_file: str = DEFAULT_CASSETTE_FILE,
         decode_compressed_response: bool = True,
     ):
@@ -243,10 +248,10 @@ class VCRRecorder:
         cls,
         test_data_dir: Path,
         cassette_subdir: str = "cassettes",
-        secrets_file: Optional[str] = None,
-        secrets_override: Optional[Dict[str, Any]] = None,
+        secrets_file: str | None = None,
+        secrets_override: dict[str, Any] | None = None,
         **kwargs,
-    ) -> "VCRRecorder":
+    ) -> VCRRecorder:
         """
         Create recorder from test directory structure.
 
@@ -293,7 +298,7 @@ class VCRRecorder:
         )
 
     @staticmethod
-    def _load_secrets_file(secrets_path: Path) -> Dict[str, Any]:
+    def _load_secrets_file(secrets_path: Path) -> dict[str, Any]:
         """Load secrets from JSON file if it exists."""
         if secrets_path.exists():
             try:
@@ -304,7 +309,7 @@ class VCRRecorder:
         return {}
 
     @staticmethod
-    def _load_custom_sanitizers(test_data_dir: Path) -> Optional[List[BaseSanitizer]]:
+    def _load_custom_sanitizers(test_data_dir: Path) -> list[BaseSanitizer] | None:
         """
         Load custom sanitizers from test directory if defined.
 
@@ -357,7 +362,7 @@ class VCRRecorder:
         """Apply sanitizers before recording request."""
         return self.sanitizer.before_record_request(request)
 
-    def _before_record_response(self, response: Dict) -> Dict:
+    def _before_record_response(self, response: dict) -> dict:
         """Apply sanitizers before recording response.
 
         Skipped during replay — cassettes already contain sanitized data
@@ -384,8 +389,6 @@ class VCRRecorder:
         Args:
             component_runner: Callable that runs the component
         """
-        from vcr.stubs import VCRHTTPResponse as _VCRHTTPResponse
-
         self.cassette_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Recording HTTP interactions to {self.cassette_path}")
 
@@ -414,6 +417,7 @@ class VCRRecorder:
 
         try:
             with vcr_context as cassette:
+
                 def streaming_append(request, response):
                     # Apply request filter directly — avoids copy.deepcopy inside original_append
                     filtered_request = self._before_record_request(request)
@@ -451,8 +455,6 @@ class VCRRecorder:
                     component_runner()
         finally:
             _VCRHTTPResponse.__init__ = _original_vcr_init
-
-        from datetime import datetime, timezone
 
         metadata = {
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -565,7 +567,7 @@ class VCRRecorder:
     def record_debug_run(
         cls,
         component_runner: Callable[[], None],
-        sanitizers: Optional[List["BaseSanitizer"]] = None,
+        sanitizers: list[BaseSanitizer] | None = None,
     ) -> None:
         """
         Record HTTP interactions during a Keboola platform debug run.
@@ -582,9 +584,6 @@ class VCRRecorder:
             component_runner: Callable that runs the component
             sanitizers: Additional sanitizers to extend the default chain
         """
-        import os
-        from datetime import datetime
-
         # Suppress loggers that print full URIs (including access tokens) at DEBUG level
         for name in ("vcr", "urllib3"):
             logging.getLogger(name).setLevel(logging.WARNING)
@@ -598,7 +597,7 @@ class VCRRecorder:
         # Build sanitizer chain
         config_path = Path(data_dir) / "config.json"
         config = json.loads(config_path.read_text()) if config_path.exists() else None
-        chain: List[BaseSanitizer] = [DefaultSanitizer(config=config)]
+        chain: list[BaseSanitizer] = [DefaultSanitizer(config=config)]
         if sanitizers:
             chain.extend(sanitizers)
 
@@ -612,7 +611,7 @@ class VCRRecorder:
         recorder.record(component_runner)
 
     @staticmethod
-    def load_metadata(cassette_path: Path) -> Dict[str, Any]:
+    def load_metadata(cassette_path: Path) -> dict[str, Any]:
         """Load _metadata from a cassette file. Returns empty dict if missing."""
         cassette_path = Path(cassette_path)
         if not cassette_path.exists():
@@ -631,7 +630,7 @@ class VCRRecorder:
         except Exception:
             return "unknown"
 
-    def _resolve_freeze_time(self) -> Optional[str]:
+    def _resolve_freeze_time(self) -> str | None:
         """Resolve effective freeze_time, reading from metadata if 'auto'."""
         if self.freeze_time_at != "auto":
             return self.freeze_time_at
@@ -664,11 +663,11 @@ class JsonIndentedSerializer:
     """Custom VCR serializer that produces indented JSON for readability."""
 
     @staticmethod
-    def serialize(cassette_dict: Dict) -> str:
+    def serialize(cassette_dict: dict) -> str:
         """Serialize cassette to indented JSON string."""
         return json.dumps(cassette_dict, indent=2, sort_keys=True)
 
     @staticmethod
-    def deserialize(cassette_string: str) -> Dict:
+    def deserialize(cassette_string: str) -> dict:
         """Deserialize JSON string to cassette dict."""
         return json.loads(cassette_string)

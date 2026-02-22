@@ -6,13 +6,16 @@ on failure, allowing for efficient comparison of test outputs without
 storing full expected files.
 """
 
+from __future__ import annotations
+
 import csv
 import difflib
+import fnmatch
 import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Literal
 
 
 @dataclass
@@ -22,8 +25,8 @@ class FileSnapshot:
     path: str
     hash: str
     size_bytes: int
-    row_count: Optional[int] = None  # For CSV files
-    columns: Optional[List[str]] = None  # For CSV files
+    row_count: int | None = None  # For CSV files
+    columns: list[str] | None = None  # For CSV files
 
 
 @dataclass
@@ -31,10 +34,10 @@ class ValidationDiff:
     """Diff information for a single file validation failure."""
 
     file_path: str
-    diff_type: str  # 'hash_mismatch', 'missing', 'unexpected', 'row_count', 'columns'
+    diff_type: Literal["hash_mismatch", "missing", "unexpected"]
     expected: Any
     actual: Any
-    unified_diff: Optional[str] = None
+    unified_diff: str | None = None
 
 
 @dataclass
@@ -43,7 +46,7 @@ class ValidationResult:
 
     success: bool
     summary: str
-    diffs: List[ValidationDiff] = field(default_factory=list)
+    diffs: list[ValidationDiff] = field(default_factory=list)
 
     def format_output(self, verbose: bool = False) -> str:
         """
@@ -99,7 +102,7 @@ class OutputSnapshot:
     def __init__(
         self,
         hash_algorithm: str = "sha256",
-        ignore_patterns: Optional[List[str]] = None,
+        ignore_patterns: list[str] | None = None,
     ):
         """
         Initialize output snapshot.
@@ -113,8 +116,6 @@ class OutputSnapshot:
 
     def _should_ignore(self, filename: str) -> bool:
         """Check if a file should be ignored based on patterns."""
-        import fnmatch
-
         for pattern in self.ignore_patterns:
             if fnmatch.fnmatch(filename, pattern):
                 return True
@@ -128,7 +129,7 @@ class OutputSnapshot:
                 hasher.update(chunk)
         return f"{self.hash_algorithm}:{hasher.hexdigest()}"
 
-    def _get_csv_metadata(self, file_path: Path) -> Tuple[Optional[int], Optional[List[str]]]:
+    def _get_csv_metadata(self, file_path: Path) -> tuple[int | None, list[str] | None]:
         """Extract metadata from a CSV file."""
         try:
             with open(file_path, "r", newline="", encoding="utf-8") as f:
@@ -162,7 +163,7 @@ class OutputSnapshot:
 
         return snapshot
 
-    def capture(self, output_dir: Path) -> Dict[str, Any]:
+    def capture(self, output_dir: Path) -> dict[str, Any]:
         """
         Capture snapshot of outputs (hashes + metadata).
 
@@ -207,7 +208,7 @@ class OutputSnapshot:
 
         return snapshot
 
-    def save(self, snapshot: Dict[str, Any], snapshot_path: Path) -> None:
+    def save(self, snapshot: dict[str, Any], snapshot_path: Path) -> None:
         """
         Save snapshot to JSON file.
 
@@ -218,7 +219,7 @@ class OutputSnapshot:
         with open(snapshot_path, "w") as f:
             json.dump(snapshot, f, indent=2, sort_keys=True)
 
-    def load(self, snapshot_path: Path) -> Dict[str, Any]:
+    def load(self, snapshot_path: Path) -> dict[str, Any]:
         """
         Load snapshot from JSON file.
 
@@ -238,7 +239,7 @@ class OutputSnapshot:
         self,
         expected_path: Path,
         actual_path: Path,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Generate unified diff between two files."""
         try:
             with open(expected_path, "r", encoding="utf-8") as f:
@@ -266,8 +267,8 @@ class OutputSnapshot:
     def validate(
         self,
         output_dir: Path,
-        expected: Dict[str, Any],
-        expected_dir: Optional[Path] = None,
+        expected: dict[str, Any],
+        expected_dir: Path | None = None,
         verbose: bool = False,
     ) -> ValidationResult:
         """
@@ -283,7 +284,7 @@ class OutputSnapshot:
             ValidationResult with success status and any differences
         """
         actual = self.capture(output_dir)
-        diffs: List[ValidationDiff] = []
+        diffs: list[ValidationDiff] = []
 
         # Compare tables
         tables_diff = self._compare_section(
@@ -329,15 +330,15 @@ class OutputSnapshot:
 
     def _compare_section(
         self,
-        expected: Dict[str, Any],
-        actual: Dict[str, Any],
+        expected: dict[str, Any],
+        actual: dict[str, Any],
         section_name: str,
         actual_base_dir: Path,
-        expected_base_dir: Optional[Path],
+        expected_base_dir: Path | None,
         verbose: bool,
-    ) -> List[ValidationDiff]:
+    ) -> list[ValidationDiff]:
         """Compare a section (tables or files) of the snapshot."""
-        diffs: List[ValidationDiff] = []
+        diffs: list[ValidationDiff] = []
 
         expected_paths = set(expected.keys())
         actual_paths = set(actual.keys())
@@ -393,7 +394,7 @@ class OutputSnapshot:
 def capture_output_snapshot(
     test_data_dir: Path,
     output_subdir: str = "out",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Convenience function to capture and return output snapshot.
 
@@ -441,7 +442,7 @@ def validate_output_snapshot(
     test_data_dir: Path,
     output_subdir: str = "out",
     snapshot_file: str = OutputSnapshot.SNAPSHOT_FILE,
-    expected_dir: Optional[Path] = None,
+    expected_dir: Path | None = None,
     verbose: bool = False,
 ) -> ValidationResult:
     """

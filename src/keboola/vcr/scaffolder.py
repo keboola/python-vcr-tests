@@ -17,13 +17,17 @@ Supports two input formats:
    keeping only dummy values in the committed ``config.json``.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from runpy import run_path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -50,21 +54,17 @@ class TestScaffolder:
 
     SECRET_PLACEHOLDER_PATTERN = re.compile(r"\{\{secret\.([^}]+)\}\}")
 
-    def __init__(self):
-        """Initialize test scaffolder."""
-        pass
-
     # ------------------------------------------------------------------
     # Raw-config detection & transformation
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _is_raw_keboola_config(entry: Dict[str, Any]) -> bool:
+    def _is_raw_keboola_config(entry: dict[str, Any]) -> bool:
         """Return True if *entry* looks like a plain Keboola config (no name/config wrapper)."""
         return "name" not in entry and "config" not in entry and "parameters" in entry
 
     @staticmethod
-    def _generate_test_name(config: Dict[str, Any], index: int) -> str:
+    def _generate_test_name(config: dict[str, Any], index: int) -> str:
         """Derive a human-readable test name from a Keboola config.
 
         Tries ``parameters.reports[0].report_type`` first, then falls back
@@ -79,8 +79,8 @@ class TestScaffolder:
     @classmethod
     def _detect_and_transform_raw_configs(
         cls,
-        definitions: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+        definitions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         """Convert a list of raw Keboola configs into the ``[{name, config}]`` format.
 
         If the entries already have ``name``/``config`` keys they are returned
@@ -109,7 +109,7 @@ class TestScaffolder:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _deep_merge(base: Dict, override: Dict) -> Dict:
+    def _deep_merge(base: dict, override: dict) -> dict:
         """Deep-merge *override* into *base*, returning a new dict."""
         result = base.copy()
         for key, value in override.items():
@@ -127,12 +127,12 @@ class TestScaffolder:
         self,
         definitions_file: Path,
         output_dir: Path,
-        component_script: Optional[Path] = None,
+        component_script: Path | None = None,
         record: bool = True,
-        freeze_time_at: Optional[str] = "2025-01-01T12:00:00",
-        secrets_file: Optional[Path] = None,
+        freeze_time_at: str | None = "2025-01-01T12:00:00",
+        secrets_file: Path | None = None,
         chain_state: bool = False,
-    ) -> List[Path]:
+    ) -> list[Path]:
         """
         Create test folders from definitions file.
 
@@ -176,7 +176,7 @@ class TestScaffolder:
         definitions = self._detect_and_transform_raw_configs(definitions)
 
         # Load external secrets file if provided
-        secrets_override: Optional[Dict[str, Any]] = None
+        secrets_override: dict[str, Any] | None = None
         if secrets_file is not None:
             secrets_file = Path(secrets_file)
             if not secrets_file.exists():
@@ -212,12 +212,12 @@ class TestScaffolder:
 
     def scaffold_from_dict(
         self,
-        definition: Dict[str, Any],
+        definition: dict[str, Any],
         output_dir: Path,
-        component_script: Optional[Path] = None,
+        component_script: Path | None = None,
         record: bool = True,
-        freeze_time_at: Optional[str] = "2025-01-01T12:00:00",
-        secrets_override: Optional[Dict[str, Any]] = None,
+        freeze_time_at: str | None = "2025-01-01T12:00:00",
+        secrets_override: dict[str, Any] | None = None,
     ) -> Path:
         """
         Create a single test folder from a definition dict.
@@ -244,13 +244,13 @@ class TestScaffolder:
 
     def _scaffold_single_test(
         self,
-        definition: Dict[str, Any],
+        definition: dict[str, Any],
         output_dir: Path,
-        component_script: Optional[Path],
+        component_script: Path | None,
         record: bool,
-        freeze_time_at: Optional[str],
-        secrets_override: Optional[Dict[str, Any]] = None,
-        input_state: Optional[Dict[str, Any]] = None,
+        freeze_time_at: str | None,
+        secrets_override: dict[str, Any] | None = None,
+        input_state: dict[str, Any] | None = None,
     ) -> Path:
         """Create folder structure for a single test."""
         # Validate definition
@@ -262,7 +262,6 @@ class TestScaffolder:
         test_name = definition["name"]
         config = definition["config"]
         secrets = definition.get("secrets", {})
-        _ = definition.get("description", "")  # Reserved for future use
 
         # Create directory structure
         test_dir = output_dir / test_name
@@ -311,9 +310,9 @@ class TestScaffolder:
 
     def _replace_secrets_with_placeholders(
         self,
-        config: Dict[str, Any],
-        secrets: Dict[str, Any],
-    ) -> Dict[str, Any]:
+        config: dict[str, Any],
+        secrets: dict[str, Any],
+    ) -> dict[str, Any]:
         """
         Replace secret values in config with placeholders.
 
@@ -323,7 +322,7 @@ class TestScaffolder:
         if not secrets:
             return config
 
-        def replace_in_value(value: Any, secrets: Dict[str, Any]) -> Any:
+        def replace_in_value(value: Any, secrets: dict[str, Any]) -> Any:
             if isinstance(value, str):
                 # Check if this value matches any secret
                 for secret_key, secret_value in secrets.items():
@@ -354,9 +353,9 @@ class TestScaffolder:
         source_data_dir: Path,
         expected_out_dir: Path,
         component_script: Path,
-        config: Dict[str, Any],
-        freeze_time_at: Optional[str],
-        secrets_override: Optional[Dict[str, Any]] = None,
+        config: dict[str, Any],
+        freeze_time_at: str | None,
+        secrets_override: dict[str, Any] | None = None,
     ) -> None:
         """Run component and record cassette.
 
@@ -390,9 +389,6 @@ class TestScaffolder:
 
         # Run component with recording
         def run_component():
-            import sys
-            from runpy import run_path
-
             os.environ["KBC_DATADIR"] = str(source_data_dir)
             # Add the component script's directory to sys.path so that
             # sibling imports (e.g. ``from configuration import ...``) resolve.
@@ -451,13 +447,13 @@ class TestScaffolder:
 
 
 def scaffold_tests(
-    definitions: List[Dict[str, Any]],
+    definitions: list[dict[str, Any]],
     output_dir: Path,
-    component_script: Optional[Path] = None,
+    component_script: Path | None = None,
     record: bool = True,
-    freeze_time_at: Optional[str] = "2025-01-01T12:00:00",
-    secrets_override: Optional[Dict[str, Any]] = None,
-) -> List[Path]:
+    freeze_time_at: str | None = "2025-01-01T12:00:00",
+    secrets_override: dict[str, Any] | None = None,
+) -> list[Path]:
     """
     Convenience function to scaffold multiple tests.
 
