@@ -150,6 +150,8 @@ class DefaultSanitizer(BaseSanitizer):
         try:
             data = json.loads(body)
             sanitized = self._sanitize_json_value(data)
+            if sanitized == data:
+                return body  # no changes → preserve original formatting
             return json.dumps(sanitized)
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
@@ -787,13 +789,20 @@ def create_default_sanitizer(secrets: dict[str, Any]) -> DefaultSanitizer:
     return DefaultSanitizer(sensitive_values=secret_values)
 
 
-def extract_values(d: dict, values: list[str]) -> list[str]:
+def extract_values(d: dict, values: list[str] | None = None) -> list[str]:
     """
     Extract all string values from a dictionary recursively.
 
     If a string value is valid JSON, parse it and extract inner values too.
     Results are sorted longest-first to prevent partial replacements.
+
+    Args:
+        d: Dictionary to extract values from.
+        values: Accumulator list.  When ``None`` (the default) a fresh list is
+            created so callers do not need to pass one explicitly.
     """
+    if values is None:
+        values = []
     for key, value in d.items():
         if isinstance(value, str) and value:
             values.append(value)

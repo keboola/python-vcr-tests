@@ -29,7 +29,7 @@ try:
 except ImportError:
     freeze_time = None  # type: ignore
 
-from .sanitizers import BaseSanitizer, CompositeSanitizer, DefaultSanitizer, create_default_sanitizer
+from .sanitizers import BaseSanitizer, CompositeSanitizer, DefaultSanitizer, create_default_sanitizer, extract_values
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +217,10 @@ class VCRRecorder:
         # Build sanitizer chain
         config_path = Path(data_dir) / "config.json"
         config = json.loads(config_path.read_text()) if config_path.exists() else None
-        chain: list[BaseSanitizer] = [DefaultSanitizer(config=config)]
+        secrets_path = Path(data_dir) / cls.DEFAULT_SECRETS_FILE
+        secrets = cls._load_secrets_file(secrets_path)
+        secret_values = extract_values(secrets)
+        chain: list[BaseSanitizer] = [DefaultSanitizer(config=config, sensitive_values=secret_values)]
         if sanitizers:
             chain.extend(sanitizers)
 
@@ -660,11 +663,20 @@ class _VCRRecordingReader:
             self._pos += pos
         elif whence == 2:
             self._pos = len(self._data) + pos
+        else:
+            raise ValueError(f"Invalid whence value {whence!r}; must be 0, 1, or 2")
         self._pos = max(0, min(self._pos, len(self._data)))
         return self._pos
 
     def getbuffer(self):
-        """Return zero-copy memoryview (used by VCRHTTPResponse.length_remaining and .data)."""
+        """Return zero-copy memoryview (used by VCRHTTPResponse.length_remaining and .data).
+
+        After ``read()`` completes, ``self._data`` is cleared to ``b""`` and this
+        method returns an empty memoryview.  This is intentional and differs from
+        ``io.BytesIO`` which preserves data after reading; the early release is
+        necessary to avoid holding the response body in memory after urllib3 has
+        assembled ``response._content``.
+        """
         return memoryview(self._data)
 
 
