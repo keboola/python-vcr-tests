@@ -26,6 +26,89 @@ from .sanitizers import BaseSanitizer, CompositeSanitizer, DefaultSanitizer, cre
 logger = logging.getLogger(__name__)
 
 
+class _VCRRecordingReader:
+    """
+    Zero-copy BytesIO replacement for VCRHTTPResponse during recording.
+
+    Standard BytesIO(data) copies bytes into its own internal buffer, creating
+    a second in-memory copy of every response body.  This class wraps the
+    original bytes directly: a full read() returns the same bytes object
+    (CPython slice optimisation: b[0:] is b), so no additional allocation occurs.
+    """
+
+    __slots__ = ("_data", "_pos")
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._pos = 0
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            chunk = self._data[self._pos :]
+            self._pos = len(self._data)
+        else:
+            chunk = self._data[self._pos : self._pos + n]
+            self._pos += len(chunk)
+        return chunk
+
+    def read1(self, n: int = -1) -> bytes:
+        return self.read(n)
+
+    def readall(self) -> bytes:
+        return self.read()
+
+    def readinto(self, b) -> int:
+        data = self.read(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
+
+    def readline(self, size: int = -1) -> bytes:
+        nl = self._data.find(b"\n", self._pos)
+        end = (nl + 1) if nl != -1 else len(self._data)
+        if size is not None and size >= 0:
+            end = min(end, self._pos + size)
+        chunk = self._data[self._pos : end]
+        self._pos = end
+        return chunk
+
+    def readlines(self, hint: int = -1) -> list:
+        lines, total = [], 0
+        while self._pos < len(self._data):
+            line = self.readline()
+            lines.append(line)
+            total += len(line)
+            if hint is not None and hint > 0 and total >= hint:
+                break
+        return lines
+
+    def seekable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return True
+
+    def isatty(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = pos
+        elif whence == 1:
+            self._pos += pos
+        elif whence == 2:
+            self._pos = len(self._data) + pos
+        self._pos = max(0, min(self._pos, len(self._data)))
+        return self._pos
+
+    def getbuffer(self):
+        """Return zero-copy memoryview (used by VCRHTTPResponse.length_remaining and .data)."""
+        return memoryview(self._data)
+
+
 class VCRRecorderError(Exception):
     """Base exception for VCR recorder errors."""
 
@@ -276,6 +359,7 @@ class VCRRecorder:
             component_runner: Callable that runs the component
         """
         from vcr.serializers import compat
+        from vcr.stubs import VCRHTTPResponse as _VCRHTTPResponse
 
         self.cassette_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Recording HTTP interactions to {self.cassette_path}")
@@ -283,43 +367,64 @@ class VCRRecorder:
         temp_path = self.cassette_path.with_suffix(".jsonl.tmp")
         temp_path.unlink(missing_ok=True)
 
+        # Patch VCRHTTPResponse to use a zero-copy reader instead of BytesIO.
+        # BytesIO(data) always copies the bytes into its own buffer, creating a
+        # second in-memory copy of every response body.  _VCRRecordingReader wraps
+        # the original bytes without copying.  The patch is scoped to recording only
+        # (replay cassettes may reuse the same recorded_response dict multiple times,
+        # so we must not mutate it there).
+        _original_vcr_init = _VCRHTTPResponse.__init__
+
+        def _zero_copy_vcr_init(self_resp, recorded_response):
+            body = recorded_response.get("body", {})
+            original_bytes = body.pop("string", b"")
+            body["string"] = b""
+            _original_vcr_init(self_resp, recorded_response)
+            self_resp._content = _VCRRecordingReader(original_bytes)
+            del body["string"]
+
+        _VCRHTTPResponse.__init__ = _zero_copy_vcr_init
+
         vcr_context = self._vcr.use_cassette(str(self.cassette_path), record_mode="all")
 
-        with vcr_context as cassette:
-            def streaming_append(request, response):
-                # Apply request filter directly — avoids copy.deepcopy inside original_append
-                filtered_request = self._before_record_request(request)
-                if not filtered_request:
-                    return
+        try:
+            with vcr_context as cassette:
+                def streaming_append(request, response):
+                    # Apply request filter directly — avoids copy.deepcopy inside original_append
+                    filtered_request = self._before_record_request(request)
+                    if not filtered_request:
+                        return
 
-                # Shallow copy prevents our sanitizer from mutating the response dict
-                # that VCRHTTPResponse will return to the component.  The bytes object
-                # referenced by body["string"] is immutable, so sharing it is safe.
-                response_copy = {
-                    **response,
-                    "body": {**response.get("body", {})},
-                    "headers": dict(response.get("headers", {})),
-                }
-                filtered_response = self._before_record_response(response_copy)
-                if filtered_response is None:
-                    return
+                    # Shallow copy prevents our sanitizer from mutating the response dict
+                    # that VCRHTTPResponse will return to the component.  The bytes object
+                    # referenced by body["string"] is immutable, so sharing it is safe.
+                    response_copy = {
+                        **response,
+                        "body": {**response.get("body", {})},
+                        "headers": dict(response.get("headers", {})),
+                    }
+                    filtered_response = self._before_record_response(response_copy)
+                    if filtered_response is None:
+                        return
 
-                interaction = {
-                    "request": compat.convert_to_unicode(filtered_request._to_dict()),
-                    "response": compat.convert_to_unicode(filtered_response),
-                }
-                with open(temp_path, "a") as f:
-                    f.write(json.dumps(interaction) + "\n")
+                    interaction = {
+                        "request": compat.convert_to_unicode(filtered_request._to_dict()),
+                        "response": compat.convert_to_unicode(filtered_response),
+                    }
+                    with open(temp_path, "a") as f:
+                        f.write(json.dumps(interaction) + "\n")
 
-            cassette.append = streaming_append
-            # Suppress the context-exit _save() — we write directly to temp_path
-            cassette._save = lambda force=False: None
+                cassette.append = streaming_append
+                # Suppress the context-exit _save() — we write directly to temp_path
+                cassette._save = lambda force=False: None
 
-            if self.freeze_time_at and self.freeze_time_at != "auto":
-                with freeze_time(self.freeze_time_at):
+                if self.freeze_time_at and self.freeze_time_at != "auto":
+                    with freeze_time(self.freeze_time_at):
+                        component_runner()
+                else:
                     component_runner()
-            else:
-                component_runner()
+        finally:
+            _VCRHTTPResponse.__init__ = _original_vcr_init
 
         from datetime import datetime, timezone
 
