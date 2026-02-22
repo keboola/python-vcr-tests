@@ -115,7 +115,7 @@ class DefaultSanitizer(BaseSanitizer):
         # Collect sensitive values: explicit + auto-detected from #-prefixed config keys
         all_values = list(sensitive_values or [])
         if config:
-            _walk_for_hash_keys(config, all_values)
+            _collect_hash_values(config, all_values)
 
         # Sort known values longest-first to prevent partial JWT replacement
         self.sensitive_values = sorted(
@@ -229,6 +229,33 @@ class DefaultSanitizer(BaseSanitizer):
                 elif isinstance(body["string"], str):
                     body["string"] = self._sanitize_body(body["string"])
 
+        return response
+
+
+class CompositeSanitizer(BaseSanitizer):
+    """
+    Combines multiple sanitizers into a single sanitizer.
+
+    Sanitizers are applied in the order they are provided.
+    """
+
+    def __init__(self, sanitizers: list[BaseSanitizer]):
+        """
+        Args:
+            sanitizers: List of sanitizers to apply in order
+        """
+        self.sanitizers = sanitizers
+
+    def before_record_request(self, request: Any) -> Any:
+        """Apply all sanitizers to the request."""
+        for sanitizer in self.sanitizers:
+            request = sanitizer.before_record_request(request)
+        return request
+
+    def before_record_response(self, response: dict) -> dict:
+        """Apply all sanitizers to the response."""
+        for sanitizer in self.sanitizers:
+            response = sanitizer.before_record_response(response)
         return response
 
 
@@ -402,37 +429,6 @@ class HeaderSanitizer(BaseSanitizer):
         return response
 
 
-class UrlPatternSanitizer(BaseSanitizer):
-    """
-    Sanitizes URL patterns using regex replacement.
-
-    Useful for redacting dynamic IDs, account numbers, or other
-    sensitive data embedded in URLs.
-    """
-
-    def __init__(self, patterns: list[tuple]):
-        """
-        Args:
-            patterns: List of (pattern, replacement) tuples.
-                      Pattern is a regex string, replacement is the string
-                      to use for matches.
-        """
-        self.patterns = [(re.compile(p), r) for p, r in patterns]
-
-    def _sanitize_url(self, url: str) -> str:
-        """Apply all patterns to the URL."""
-        result = url
-        for pattern, replacement in self.patterns:
-            result = pattern.sub(replacement, result)
-        return result
-
-    def before_record_request(self, request: Any) -> Any:
-        """Sanitize URL patterns in request URI."""
-        if hasattr(request, "uri"):
-            request.uri = self._sanitize_url(request.uri)
-        return request
-
-
 class BodyFieldSanitizer(BaseSanitizer):
     """
     Sanitizes specific fields in JSON request/response bodies.
@@ -505,7 +501,7 @@ class BodyFieldSanitizer(BaseSanitizer):
         return response
 
 
-class QueryParameterTokenSanitizer(BaseSanitizer):
+class QueryParamSanitizer(BaseSanitizer):
     """
     Replaces URL query parameter values with a placeholder.
 
@@ -515,7 +511,7 @@ class QueryParameterTokenSanitizer(BaseSanitizer):
     that aren't known at recording time.
 
     Example:
-        sanitizer = QueryParameterTokenSanitizer(
+        sanitizer = QueryParamSanitizer(
             parameters=["access_token"], replacement="token"
         )
         # "...?access_token=EAACh5tPbZAJEB..." -> "...?access_token=token..."
@@ -550,6 +546,37 @@ class QueryParameterTokenSanitizer(BaseSanitizer):
                     body_str = body["string"].decode("utf-8", errors="ignore")
                     body["string"] = self._sanitize_string(body_str).encode("utf-8")
         return response
+
+
+class UrlPatternSanitizer(BaseSanitizer):
+    """
+    Sanitizes URL patterns using regex replacement.
+
+    Useful for redacting dynamic IDs, account numbers, or other
+    sensitive data embedded in URLs.
+    """
+
+    def __init__(self, patterns: list[tuple]):
+        """
+        Args:
+            patterns: List of (pattern, replacement) tuples.
+                      Pattern is a regex string, replacement is the string
+                      to use for matches.
+        """
+        self.patterns = [(re.compile(p), r) for p, r in patterns]
+
+    def _sanitize_url(self, url: str) -> str:
+        """Apply all patterns to the URL."""
+        result = url
+        for pattern, replacement in self.patterns:
+            result = pattern.sub(replacement, result)
+        return result
+
+    def before_record_request(self, request: Any) -> Any:
+        """Sanitize URL patterns in request URI."""
+        if hasattr(request, "uri"):
+            request.uri = self._sanitize_url(request.uri)
+        return request
 
 
 class ResponseUrlSanitizer(BaseSanitizer):
@@ -654,33 +681,6 @@ class CallbackSanitizer(BaseSanitizer):
         return response
 
 
-class CompositeSanitizer(BaseSanitizer):
-    """
-    Combines multiple sanitizers into a single sanitizer.
-
-    Sanitizers are applied in the order they are provided.
-    """
-
-    def __init__(self, sanitizers: list[BaseSanitizer]):
-        """
-        Args:
-            sanitizers: List of sanitizers to apply in order
-        """
-        self.sanitizers = sanitizers
-
-    def before_record_request(self, request: Any) -> Any:
-        """Apply all sanitizers to the request."""
-        for sanitizer in self.sanitizers:
-            request = sanitizer.before_record_request(request)
-        return request
-
-    def before_record_response(self, response: dict) -> dict:
-        """Apply all sanitizers to the response."""
-        for sanitizer in self.sanitizers:
-            response = sanitizer.before_record_response(response)
-        return response
-
-
 class ConfigSecretsSanitizer(BaseSanitizer):
     """
     Auto-sanitizer for Keboola encrypted config parameters.
@@ -719,7 +719,7 @@ class ConfigSecretsSanitizer(BaseSanitizer):
     def _extract_hash_secrets(config: dict[str, Any]) -> list[str]:
         """Recursively find all values under #-prefixed keys."""
         secrets: list[str] = []
-        _walk_for_hash_keys(config, secrets)
+        _collect_hash_values(config, secrets)
         # Sort longest-first to prevent partial replacements
         return sorted(set(s for s in secrets if s), key=len, reverse=True)
 
@@ -769,30 +769,22 @@ class ConfigSecretsSanitizer(BaseSanitizer):
         return response
 
 
-def _walk_for_hash_keys(obj: Any, secrets: list[str]) -> None:
-    """Recursively walk a dict/list and collect values under #-prefixed keys."""
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if isinstance(key, str) and key.startswith("#"):
-                # Collect all string values under this key
-                _collect_strings(value, secrets)
-            else:
-                _walk_for_hash_keys(value, secrets)
-    elif isinstance(obj, list):
-        for item in obj:
-            _walk_for_hash_keys(item, secrets)
+def create_default_sanitizer(secrets: dict[str, Any]) -> DefaultSanitizer:
+    """
+    Create a default sanitizer from secrets.
 
+    Extracts all string values from the secrets dict and returns a
+    DefaultSanitizer that handles OAuth bodies, JSON responses, headers,
+    and URL parameters automatically.
 
-def _collect_strings(obj: Any, strings: list[str]) -> None:
-    """Collect all string values from a nested structure."""
-    if isinstance(obj, str) and obj:
-        strings.append(obj)
-    elif isinstance(obj, dict):
-        for value in obj.values():
-            _collect_strings(value, strings)
-    elif isinstance(obj, list):
-        for item in obj:
-            _collect_strings(item, strings)
+    Args:
+        secrets: Dictionary of secret values to redact
+
+    Returns:
+        A DefaultSanitizer with extracted secret values
+    """
+    secret_values = extract_values(secrets, [])
+    return DefaultSanitizer(sensitive_values=secret_values)
 
 
 def extract_values(d: dict, values: list[str]) -> list[str]:
@@ -829,19 +821,27 @@ def extract_values(d: dict, values: list[str]) -> list[str]:
     return values
 
 
-def create_default_sanitizer(secrets: dict[str, Any]) -> DefaultSanitizer:
-    """
-    Create a default sanitizer from secrets.
+def _collect_hash_values(obj: Any, secrets: list[str]) -> None:
+    """Recursively walk a dict/list and collect values under #-prefixed keys."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(key, str) and key.startswith("#"):
+                # Collect all string values under this key
+                _collect_strings(value, secrets)
+            else:
+                _collect_hash_values(value, secrets)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_hash_values(item, secrets)
 
-    Extracts all string values from the secrets dict and returns a
-    DefaultSanitizer that handles OAuth bodies, JSON responses, headers,
-    and URL parameters automatically.
 
-    Args:
-        secrets: Dictionary of secret values to redact
-
-    Returns:
-        A DefaultSanitizer with extracted secret values
-    """
-    secret_values = extract_values(secrets, [])
-    return DefaultSanitizer(sensitive_values=secret_values)
+def _collect_strings(obj: Any, strings: list[str]) -> None:
+    """Collect all string values from a nested structure."""
+    if isinstance(obj, str) and obj:
+        strings.append(obj)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _collect_strings(value, strings)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_strings(item, strings)

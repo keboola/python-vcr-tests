@@ -9,6 +9,7 @@ for deterministic testing.
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import logging
 import os
@@ -31,116 +32,6 @@ except ImportError:
 from .sanitizers import BaseSanitizer, CompositeSanitizer, DefaultSanitizer, create_default_sanitizer
 
 logger = logging.getLogger(__name__)
-
-
-class _VCRRecordingReader:
-    """
-    Zero-copy BytesIO replacement for VCRHTTPResponse during recording.
-
-    Standard BytesIO(data) copies bytes into its own internal buffer, creating
-    a second in-memory copy of every response body.  This class wraps the
-    original bytes directly: a full read() returns the same bytes object
-    (CPython slice optimisation: b[0:] is b), so no additional allocation occurs.
-    """
-
-    __slots__ = ("_data", "_pos")
-
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-        self._pos = 0
-
-    def read(self, n: int = -1) -> bytes:
-        if n is None or n < 0:
-            chunk = self._data[self._pos :]
-            self._pos = len(self._data)
-            self._data = b""  # release: caller (urllib3/requests) now owns the only copy
-        else:
-            chunk = self._data[self._pos : self._pos + n]
-            self._pos += len(chunk)
-            if self._pos >= len(self._data):
-                self._data = b""  # release after chunked reads reach the end
-        return chunk
-
-    def read1(self, n: int = -1) -> bytes:
-        return self.read(n)
-
-    def readall(self) -> bytes:
-        return self.read()
-
-    def readinto(self, b) -> int:
-        data = self.read(len(b))
-        n = len(data)
-        b[:n] = data
-        return n
-
-    def readline(self, size: int = -1) -> bytes:
-        nl = self._data.find(b"\n", self._pos)
-        end = (nl + 1) if nl != -1 else len(self._data)
-        if size is not None and size >= 0:
-            end = min(end, self._pos + size)
-        chunk = self._data[self._pos : end]
-        self._pos = end
-        return chunk
-
-    def readlines(self, hint: int = -1) -> list:
-        lines, total = [], 0
-        while self._pos < len(self._data):
-            line = self.readline()
-            lines.append(line)
-            total += len(line)
-            if hint is not None and hint > 0 and total >= hint:
-                break
-        return lines
-
-    def seekable(self) -> bool:
-        return True
-
-    def readable(self) -> bool:
-        return True
-
-    def isatty(self) -> bool:
-        return False
-
-    def tell(self) -> int:
-        return self._pos
-
-    def seek(self, pos: int, whence: int = 0) -> int:
-        if whence == 0:
-            self._pos = pos
-        elif whence == 1:
-            self._pos += pos
-        elif whence == 2:
-            self._pos = len(self._data) + pos
-        self._pos = max(0, min(self._pos, len(self._data)))
-        return self._pos
-
-    def getbuffer(self):
-        """Return zero-copy memoryview (used by VCRHTTPResponse.length_remaining and .data)."""
-        return memoryview(self._data)
-
-
-class _BytesEncoder(json.JSONEncoder):
-    """
-    JSON encoder that serialises bytes inline without a separate unicode copy.
-
-    Standard approach (compat.convert_to_unicode + json.dumps) creates two
-    extra allocations per response body:
-      1. convert_to_unicode mutates the body str in the response dict (new str object)
-      2. json.dumps builds the full JSON string in memory before writing
-
-    This encoder instead calls json.dump() directly so the output is streamed
-    to the file object chunk-by-chunk.  When it encounters bytes it decodes them
-    inline (UTF-8 or base64), matching what compat.convert_to_unicode produces,
-    so the cassette format is byte-for-byte identical.
-    """
-
-    def default(self, obj):
-        if isinstance(obj, bytes):
-            try:
-                return obj.decode("utf-8")
-            except UnicodeDecodeError:
-                return base64.b64encode(obj).decode("ascii")
-        return super().default(obj)
 
 
 class VCRRecorderError(Exception):
@@ -238,14 +129,6 @@ class VCRRecorder:
         # Configure VCR
         self._vcr = self._create_vcr_instance()
 
-    @staticmethod
-    def _check_dependencies():
-        """Check that required dependencies are installed."""
-        if vcr is None:
-            raise ImportError("vcrpy is required for VCR functionality. Install it with: pip install vcrpy")
-        if freeze_time is None:
-            raise ImportError("freezegun is required for VCR functionality. Install it with: pip install freezegun")
-
     @classmethod
     def from_test_dir(
         cls,
@@ -300,272 +183,6 @@ class VCRRecorder:
             **kwargs,
         )
 
-    @staticmethod
-    def _load_secrets_file(secrets_path: Path) -> dict[str, Any]:
-        """Load secrets from JSON file if it exists."""
-        if secrets_path.exists():
-            try:
-                with open(secrets_path, "r") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, OSError) as e:
-                raise SecretsLoadError(f"Failed to load secrets from {secrets_path}: {e}")
-        return {}
-
-    @staticmethod
-    def _load_custom_sanitizers(test_data_dir: Path) -> list[BaseSanitizer] | None:
-        """
-        Load custom sanitizers from test directory if defined.
-
-        Looks for a sanitizers.py file with a get_sanitizers() function.
-        """
-        sanitizers_path = test_data_dir / "sanitizers.py"
-        if not sanitizers_path.exists():
-            return None
-
-        import importlib.util
-
-        try:
-            spec = importlib.util.spec_from_file_location("custom_sanitizers", sanitizers_path)
-            if spec is None or spec.loader is None:
-                return None
-
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-
-            if hasattr(module, "get_sanitizers"):
-                config_path = test_data_dir / "config.json"
-                config = {}
-                if config_path.exists():
-                    with open(config_path, "r") as f:
-                        config = json.load(f)
-                return module.get_sanitizers(config)
-        except Exception as e:
-            logger.warning(f"Failed to load custom sanitizers from {sanitizers_path}: {e}")
-
-        return None
-
-    def _create_vcr_instance(self) -> Any:
-        """Create and configure the VCR instance."""
-        my_vcr = vcr.VCR(
-            serializer="json",
-            cassette_library_dir=str(self.cassette_dir),
-            record_mode=self.record_mode,
-            match_on=self.match_on,
-            decode_compressed_response=self.decode_compressed_response,
-            before_record_request=self._before_record_request,
-            before_record_response=self._before_record_response,
-        )
-
-        # Register JSON serializer with indentation for readability
-        my_vcr.register_serializer("json", JsonIndentedSerializer())
-
-        return my_vcr
-
-    def _before_record_request(self, request: Any) -> Any:
-        """Apply sanitizers before recording request."""
-        return self.sanitizer.before_record_request(request)
-
-    def _before_record_response(self, response: dict) -> dict:
-        """Apply sanitizers before recording response.
-
-        Skipped during replay — cassettes already contain sanitized data
-        from recording time.  Re-sanitizing during replay would cause
-        output drift whenever sanitizers change.
-        """
-        if self._is_replaying:
-            return response
-        return self.sanitizer.before_record_response(response)
-
-    def has_cassette(self) -> bool:
-        """Check if cassette exists for replay."""
-        return self.cassette_path.exists()
-
-    def record(self, component_runner: Callable[[], None]) -> None:
-        """
-        Record HTTP interactions while running component.
-
-        Each interaction is serialized and streamed to a temporary JSONL file
-        immediately after being captured, then removed from vcrpy's in-memory
-        buffer. This keeps memory usage constant regardless of job size.
-        The final cassette JSON is reconstructed from the temp file at the end.
-
-        Args:
-            component_runner: Callable that runs the component
-        """
-        self.cassette_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Recording HTTP interactions to {self.cassette_path}")
-
-        temp_path = self.cassette_path.with_suffix(".jsonl.tmp")
-        temp_path.unlink(missing_ok=True)
-
-        # Patch VCRHTTPResponse to use a zero-copy reader instead of BytesIO.
-        # BytesIO(data) always copies the bytes into its own buffer, creating a
-        # second in-memory copy of every response body.  _VCRRecordingReader wraps
-        # the original bytes without copying.  The patch is scoped to recording only
-        # (replay cassettes may reuse the same recorded_response dict multiple times,
-        # so we must not mutate it there).
-        _original_vcr_init = _VCRHTTPResponse.__init__
-
-        def _zero_copy_vcr_init(self_resp, recorded_response):
-            body = recorded_response.get("body", {})
-            original_bytes = body.pop("string", b"")
-            body["string"] = b""
-            _original_vcr_init(self_resp, recorded_response)
-            self_resp._content = _VCRRecordingReader(original_bytes)
-            del body["string"]
-
-        _VCRHTTPResponse.__init__ = _zero_copy_vcr_init
-
-        vcr_context = self._vcr.use_cassette(str(self.cassette_path), record_mode="all")
-
-        try:
-            with vcr_context as cassette:
-
-                def streaming_append(request, response):
-                    # Apply request filter directly — avoids copy.deepcopy inside original_append
-                    filtered_request = self._before_record_request(request)
-                    if not filtered_request:
-                        return
-
-                    # Shallow copy prevents our sanitizer from mutating the response dict
-                    # that VCRHTTPResponse will return to the component.  The bytes object
-                    # referenced by body["string"] is immutable, so sharing it is safe.
-                    response_copy = {
-                        **response,
-                        "body": {**response.get("body", {})},
-                        "headers": dict(response.get("headers", {})),
-                    }
-                    filtered_response = self._before_record_response(response_copy)
-                    if filtered_response is None:
-                        return
-
-                    with open(temp_path, "a") as f:
-                        json.dump(
-                            {"request": filtered_request._to_dict(), "response": filtered_response},
-                            f,
-                            cls=_BytesEncoder,
-                        )
-                        f.write("\n")
-
-                cassette.append = streaming_append
-                # Suppress the context-exit _save() — we write directly to temp_path
-                cassette._save = lambda force=False: None
-
-                if self.freeze_time_at and self.freeze_time_at != "auto":
-                    with freeze_time(self.freeze_time_at):
-                        component_runner()
-                else:
-                    component_runner()
-        finally:
-            _VCRHTTPResponse.__init__ = _original_vcr_init
-
-        metadata = {
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "freeze_time": self.freeze_time_at,
-            "keboola_vcr_version": self._get_version(),
-        }
-        self._build_cassette_from_jsonl(temp_path, metadata)
-        temp_path.unlink(missing_ok=True)
-        logger.info(f"Recorded cassette to {self.cassette_path}")
-
-    def _build_cassette_from_jsonl(self, temp_path: Path, metadata: dict) -> None:
-        """Stream-write the cassette JSON from the JSONL temp file with inline metadata.
-
-        Writes the output file line-by-line to avoid loading all interactions into
-        memory at once (avoids a secondary OOM spike after recording finishes).
-        """
-        with open(self.cassette_path, "w") as out:
-            out.write("{\n")
-            out.write('  "_metadata": ' + json.dumps(metadata, sort_keys=True) + ",\n")
-            out.write('  "interactions": [\n')
-            first = True
-            if temp_path.exists():
-                with open(temp_path) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if not first:
-                            out.write(",\n")
-                        out.write("    ")
-                        out.write(line)
-                        first = False
-            out.write('\n  ],\n  "version": 1\n}\n')
-
-    def replay(self, component_runner: Callable[[], None]) -> None:
-        """
-        Replay recorded HTTP interactions.
-
-        This will:
-        1. Check that a cassette exists
-        2. Freeze time to the configured timestamp
-        3. Run the component while replaying recorded HTTP interactions
-
-        Args:
-            component_runner: Callable that runs the component
-
-        Raises:
-            CassetteMissingError: If no cassette exists for replay
-        """
-        if not self.has_cassette():
-            raise CassetteMissingError(
-                f"No cassette found at {self.cassette_path}. Run with --record flag to create one."
-            )
-
-        logger.info(f"Replaying HTTP interactions from {self.cassette_path}")
-
-        effective_freeze_time = self._resolve_freeze_time()
-
-        vcr_context = self._vcr.use_cassette(
-            str(self.cassette_path),
-            record_mode="none",
-        )
-
-        self._is_replaying = True
-        try:
-            if effective_freeze_time:
-                with freeze_time(effective_freeze_time):
-                    with vcr_context:
-                        component_runner()
-            else:
-                with vcr_context:
-                    component_runner()
-        finally:
-            self._is_replaying = False
-
-        logger.info("Replay completed successfully")
-
-    def run(
-        self,
-        component_runner: Callable[[], None],
-        mode: str = "auto",
-    ) -> None:
-        """
-        Run component with VCR in specified mode.
-
-        Args:
-            component_runner: Callable that runs the component
-            mode: One of:
-                - 'record': Always record (requires credentials)
-                - 'replay': Always replay (fails if no cassette)
-                - 'auto': Replay if cassette exists, otherwise record
-
-        Raises:
-            ValueError: If mode is invalid
-            CassetteMissingError: If mode is 'replay' and no cassette exists
-        """
-        if mode == "record":
-            self.record(component_runner)
-        elif mode == "replay":
-            self.replay(component_runner)
-        elif mode == "auto":
-            if self.has_cassette():
-                self.replay(component_runner)
-            else:
-                self.record(component_runner)
-        else:
-            raise ValueError(f"Invalid VCR mode: {mode}. Must be 'record', 'replay', or 'auto'")
-
     @classmethod
     def record_debug_run(
         cls,
@@ -613,6 +230,149 @@ class VCRRecorder:
         )
         recorder.record(component_runner)
 
+    def run(
+        self,
+        component_runner: Callable[[], None],
+        mode: str = "auto",
+    ) -> None:
+        """
+        Run component with VCR in specified mode.
+
+        Args:
+            component_runner: Callable that runs the component
+            mode: One of:
+                - 'record': Always record (requires credentials)
+                - 'replay': Always replay (fails if no cassette)
+                - 'auto': Replay if cassette exists, otherwise record
+
+        Raises:
+            ValueError: If mode is invalid
+            CassetteMissingError: If mode is 'replay' and no cassette exists
+        """
+        if mode == "record":
+            self.record(component_runner)
+        elif mode == "replay":
+            self.replay(component_runner)
+        elif mode == "auto":
+            if self.has_cassette():
+                self.replay(component_runner)
+            else:
+                self.record(component_runner)
+        else:
+            raise ValueError(f"Invalid VCR mode: {mode}. Must be 'record', 'replay', or 'auto'")
+
+    def record(self, component_runner: Callable[[], None]) -> None:
+        """
+        Record HTTP interactions while running component.
+
+        Each interaction is serialized and streamed to a temporary JSONL file
+        immediately after being captured, then removed from vcrpy's in-memory
+        buffer. This keeps memory usage constant regardless of job size.
+        The final cassette JSON is reconstructed from the temp file at the end.
+
+        Args:
+            component_runner: Callable that runs the component
+        """
+        self.cassette_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Recording HTTP interactions to {self.cassette_path}")
+
+        temp_path = self.cassette_path.with_suffix(".jsonl.tmp")
+        temp_path.unlink(missing_ok=True)
+
+        # Patch VCRHTTPResponse to use a zero-copy reader instead of BytesIO.
+        # BytesIO(data) always copies the bytes into its own buffer, creating a
+        # second in-memory copy of every response body.  _VCRRecordingReader wraps
+        # the original bytes without copying.  The patch is scoped to recording only
+        # (replay cassettes may reuse the same recorded_response dict multiple times,
+        # so we must not mutate it there).
+        _original_vcr_init = _VCRHTTPResponse.__init__
+        _VCRHTTPResponse.__init__ = functools.partial(_zero_copy_vcr_response_init, original_init=_original_vcr_init)
+
+        vcr_context = self._vcr.use_cassette(str(self.cassette_path), record_mode="all")
+
+        try:
+            with vcr_context as cassette:
+                cassette.append = functools.partial(self._append_interaction, temp_path)
+                # Suppress the context-exit _save() — we write directly to temp_path
+                cassette._save = lambda force=False: None
+
+                if self.freeze_time_at and self.freeze_time_at != "auto":
+                    with freeze_time(self.freeze_time_at):
+                        component_runner()
+                else:
+                    component_runner()
+        finally:
+            _VCRHTTPResponse.__init__ = _original_vcr_init
+
+        metadata = {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "freeze_time": self.freeze_time_at,
+            "keboola_vcr_version": self._get_version(),
+        }
+        self._write_cassette(temp_path, metadata)
+        temp_path.unlink(missing_ok=True)
+        logger.info(f"Recorded cassette to {self.cassette_path}")
+
+    def replay(self, component_runner: Callable[[], None]) -> None:
+        """
+        Replay recorded HTTP interactions.
+
+        This will:
+        1. Check that a cassette exists
+        2. Freeze time to the configured timestamp
+        3. Run the component while replaying recorded HTTP interactions
+
+        Args:
+            component_runner: Callable that runs the component
+
+        Raises:
+            CassetteMissingError: If no cassette exists for replay
+        """
+        if not self.has_cassette():
+            raise CassetteMissingError(
+                f"No cassette found at {self.cassette_path}. Run with --record flag to create one."
+            )
+
+        logger.info(f"Replaying HTTP interactions from {self.cassette_path}")
+
+        effective_freeze_time = self._resolve_freeze_time()
+
+        vcr_context = self._vcr.use_cassette(
+            str(self.cassette_path),
+            record_mode="none",
+        )
+
+        self._is_replaying = True
+        try:
+            if effective_freeze_time:
+                with freeze_time(effective_freeze_time):
+                    with vcr_context:
+                        component_runner()
+            else:
+                with vcr_context:
+                    component_runner()
+        finally:
+            self._is_replaying = False
+
+        logger.info("Replay completed successfully")
+
+    def has_cassette(self) -> bool:
+        """Check if cassette exists for replay."""
+        return self.cassette_path.exists()
+
+    def clear_cassette(self) -> bool:
+        """
+        Delete the cassette file if it exists.
+
+        Returns:
+            True if cassette was deleted, False if it didn't exist
+        """
+        if self.has_cassette():
+            self.cassette_path.unlink()
+            logger.info(f"Deleted cassette at {self.cassette_path}")
+            return True
+        return False
+
     @staticmethod
     def load_metadata(cassette_path: Path) -> dict[str, Any]:
         """Load _metadata from a cassette file. Returns empty dict if missing."""
@@ -623,15 +383,32 @@ class VCRRecorder:
             data = json.load(f)
         return data.get("_metadata", {})
 
-    @staticmethod
-    def _get_version() -> str:
-        """Get keboola.vcr package version."""
-        try:
-            from importlib.metadata import version
+    def _append_interaction(self, temp_path: Path, request, response) -> None:
+        """Serialize a single recorded interaction to the JSONL temp file."""
+        # Apply request filter directly — avoids copy.deepcopy inside original_append
+        filtered_request = self._before_record_request(request)
+        if not filtered_request:
+            return
 
-            return version("keboola.vcr")
-        except Exception:
-            return "unknown"
+        # Shallow copy prevents our sanitizer from mutating the response dict
+        # that VCRHTTPResponse will return to the component.  The bytes object
+        # referenced by body["string"] is immutable, so sharing it is safe.
+        response_copy = {
+            **response,
+            "body": {**response.get("body", {})},
+            "headers": dict(response.get("headers", {})),
+        }
+        filtered_response = self._before_record_response(response_copy)
+        if filtered_response is None:
+            return
+
+        with open(temp_path, "a") as f:
+            json.dump(
+                {"request": filtered_request._to_dict(), "response": filtered_response},
+                f,
+                cls=_BytesEncoder,
+            )
+            f.write("\n")
 
     def _resolve_freeze_time(self) -> str | None:
         """Resolve effective freeze_time, reading from metadata if 'auto'."""
@@ -648,18 +425,123 @@ class VCRRecorder:
         logger.info(f"Auto-resolved freeze_time from cassette metadata: {resolved}")
         return resolved
 
-    def clear_cassette(self) -> bool:
-        """
-        Delete the cassette file if it exists.
+    def _write_cassette(self, temp_path: Path, metadata: dict) -> None:
+        """Stream-write the cassette JSON from the JSONL temp file with inline metadata.
 
-        Returns:
-            True if cassette was deleted, False if it didn't exist
+        Writes the output file line-by-line to avoid loading all interactions into
+        memory at once (avoids a secondary OOM spike after recording finishes).
         """
-        if self.has_cassette():
-            self.cassette_path.unlink()
-            logger.info(f"Deleted cassette at {self.cassette_path}")
-            return True
-        return False
+        with open(self.cassette_path, "w") as out:
+            out.write("{\n")
+            out.write('  "_metadata": ' + json.dumps(metadata, sort_keys=True) + ",\n")
+            out.write('  "interactions": [\n')
+            first = True
+            if temp_path.exists():
+                with open(temp_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if not first:
+                            out.write(",\n")
+                        out.write("    ")
+                        out.write(line)
+                        first = False
+            out.write('\n  ],\n  "version": 1\n}\n')
+
+    def _before_record_request(self, request: Any) -> Any:
+        """Apply sanitizers before recording request."""
+        return self.sanitizer.before_record_request(request)
+
+    def _before_record_response(self, response: dict) -> dict:
+        """Apply sanitizers before recording response.
+
+        Skipped during replay — cassettes already contain sanitized data
+        from recording time.  Re-sanitizing during replay would cause
+        output drift whenever sanitizers change.
+        """
+        if self._is_replaying:
+            return response
+        return self.sanitizer.before_record_response(response)
+
+    def _create_vcr_instance(self) -> Any:
+        """Create and configure the VCR instance."""
+        my_vcr = vcr.VCR(
+            serializer="json",
+            cassette_library_dir=str(self.cassette_dir),
+            record_mode=self.record_mode,
+            match_on=self.match_on,
+            decode_compressed_response=self.decode_compressed_response,
+            before_record_request=self._before_record_request,
+            before_record_response=self._before_record_response,
+        )
+
+        # Register JSON serializer with indentation for readability
+        my_vcr.register_serializer("json", JsonIndentedSerializer())
+
+        return my_vcr
+
+    @staticmethod
+    def _load_custom_sanitizers(test_data_dir: Path) -> list[BaseSanitizer] | None:
+        """
+        Load custom sanitizers from test directory if defined.
+
+        Looks for a sanitizers.py file with a get_sanitizers() function.
+        """
+        sanitizers_path = test_data_dir / "sanitizers.py"
+        if not sanitizers_path.exists():
+            return None
+
+        import importlib.util
+
+        try:
+            spec = importlib.util.spec_from_file_location("custom_sanitizers", sanitizers_path)
+            if spec is None or spec.loader is None:
+                return None
+
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            if hasattr(module, "get_sanitizers"):
+                config_path = test_data_dir / "config.json"
+                config = {}
+                if config_path.exists():
+                    with open(config_path, "r") as f:
+                        config = json.load(f)
+                return module.get_sanitizers(config)
+        except Exception as e:
+            logger.warning(f"Failed to load custom sanitizers from {sanitizers_path}: {e}")
+
+        return None
+
+    @staticmethod
+    def _load_secrets_file(secrets_path: Path) -> dict[str, Any]:
+        """Load secrets from JSON file if it exists."""
+        if secrets_path.exists():
+            try:
+                with open(secrets_path, "r") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                raise SecretsLoadError(f"Failed to load secrets from {secrets_path}: {e}")
+        return {}
+
+    @staticmethod
+    def _get_version() -> str:
+        """Get keboola.vcr package version."""
+        try:
+            from importlib.metadata import version
+
+            return version("keboola.vcr")
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _check_dependencies():
+        """Check that required dependencies are installed."""
+        if vcr is None:
+            raise ImportError("vcrpy is required for VCR functionality. Install it with: pip install vcrpy")
+        if freeze_time is None:
+            raise ImportError("freezegun is required for VCR functionality. Install it with: pip install freezegun")
 
 
 class JsonIndentedSerializer:
@@ -674,3 +556,128 @@ class JsonIndentedSerializer:
     def deserialize(cassette_string: str) -> dict:
         """Deserialize JSON string to cassette dict."""
         return json.loads(cassette_string)
+
+
+class _BytesEncoder(json.JSONEncoder):
+    """
+    JSON encoder that serialises bytes inline without a separate unicode copy.
+
+    Standard approach (compat.convert_to_unicode + json.dumps) creates two
+    extra allocations per response body:
+      1. convert_to_unicode mutates the body str in the response dict (new str object)
+      2. json.dumps builds the full JSON string in memory before writing
+
+    This encoder instead calls json.dump() directly so the output is streamed
+    to the file object chunk-by-chunk.  When it encounters bytes it decodes them
+    inline (UTF-8 or base64), matching what compat.convert_to_unicode produces,
+    so the cassette format is byte-for-byte identical.
+    """
+
+    def default(self, obj):
+        if isinstance(obj, bytes):
+            try:
+                return obj.decode("utf-8")
+            except UnicodeDecodeError:
+                return base64.b64encode(obj).decode("ascii")
+        return super().default(obj)
+
+
+class _VCRRecordingReader:
+    """
+    Zero-copy BytesIO replacement for VCRHTTPResponse during recording.
+
+    Standard BytesIO(data) copies bytes into its own internal buffer, creating
+    a second in-memory copy of every response body.  This class wraps the
+    original bytes directly: a full read() returns the same bytes object
+    (CPython slice optimisation: b[0:] is b), so no additional allocation occurs.
+    """
+
+    __slots__ = ("_data", "_pos")
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._pos = 0
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            chunk = self._data[self._pos :]
+            self._pos = len(self._data)
+            self._data = b""  # release: caller (urllib3/requests) now owns the only copy
+        else:
+            chunk = self._data[self._pos : self._pos + n]
+            self._pos += len(chunk)
+            if self._pos >= len(self._data):
+                self._data = b""  # release after chunked reads reach the end
+        return chunk
+
+    def read1(self, n: int = -1) -> bytes:
+        return self.read(n)
+
+    def readall(self) -> bytes:
+        return self.read()
+
+    def readinto(self, b) -> int:
+        data = self.read(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
+
+    def readline(self, size: int = -1) -> bytes:
+        nl = self._data.find(b"\n", self._pos)
+        end = (nl + 1) if nl != -1 else len(self._data)
+        if size is not None and size >= 0:
+            end = min(end, self._pos + size)
+        chunk = self._data[self._pos : end]
+        self._pos = end
+        return chunk
+
+    def readlines(self, hint: int = -1) -> list:
+        lines, total = [], 0
+        while self._pos < len(self._data):
+            line = self.readline()
+            lines.append(line)
+            total += len(line)
+            if hint is not None and hint > 0 and total >= hint:
+                break
+        return lines
+
+    def seekable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return True
+
+    def isatty(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = pos
+        elif whence == 1:
+            self._pos += pos
+        elif whence == 2:
+            self._pos = len(self._data) + pos
+        self._pos = max(0, min(self._pos, len(self._data)))
+        return self._pos
+
+    def getbuffer(self):
+        """Return zero-copy memoryview (used by VCRHTTPResponse.length_remaining and .data)."""
+        return memoryview(self._data)
+
+
+def _zero_copy_vcr_response_init(self_resp, recorded_response, *, original_init) -> None:
+    """Patch target for VCRHTTPResponse.__init__ during recording.
+
+    Swaps BytesIO for a _VCRRecordingReader so the response body bytes are
+    not copied into a second buffer.  ``original_init`` is passed via
+    functools.partial so this can live at module level without a closure.
+    """
+    body = recorded_response.get("body", {})
+    original_bytes = body.pop("string", b"")
+    body["string"] = b""
+    original_init(self_resp, recorded_response)
+    self_resp._content = _VCRRecordingReader(original_bytes)
+    del body["string"]
