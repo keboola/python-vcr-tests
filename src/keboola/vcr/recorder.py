@@ -109,6 +109,32 @@ class _VCRRecordingReader:
         return memoryview(self._data)
 
 
+class _BytesEncoder(json.JSONEncoder):
+    """
+    JSON encoder that serialises bytes inline without a separate unicode copy.
+
+    Standard approach (compat.convert_to_unicode + json.dumps) creates two
+    extra allocations per response body:
+      1. convert_to_unicode mutates the body str in the response dict (new str object)
+      2. json.dumps builds the full JSON string in memory before writing
+
+    This encoder instead calls json.dump() directly so the output is streamed
+    to the file object chunk-by-chunk.  When it encounters bytes it decodes them
+    inline (UTF-8 or base64), matching what compat.convert_to_unicode produces,
+    so the cassette format is byte-for-byte identical.
+    """
+
+    def default(self, obj):
+        if isinstance(obj, bytes):
+            try:
+                return obj.decode("utf-8")
+            except UnicodeDecodeError:
+                import base64
+
+                return base64.b64encode(obj).decode("ascii")
+        return super().default(obj)
+
+
 class VCRRecorderError(Exception):
     """Base exception for VCR recorder errors."""
 
@@ -358,7 +384,6 @@ class VCRRecorder:
         Args:
             component_runner: Callable that runs the component
         """
-        from vcr.serializers import compat
         from vcr.stubs import VCRHTTPResponse as _VCRHTTPResponse
 
         self.cassette_dir.mkdir(parents=True, exist_ok=True)
@@ -407,12 +432,13 @@ class VCRRecorder:
                     if filtered_response is None:
                         return
 
-                    interaction = {
-                        "request": compat.convert_to_unicode(filtered_request._to_dict()),
-                        "response": compat.convert_to_unicode(filtered_response),
-                    }
                     with open(temp_path, "a") as f:
-                        f.write(json.dumps(interaction) + "\n")
+                        json.dump(
+                            {"request": filtered_request._to_dict(), "response": filtered_response},
+                            f,
+                            cls=_BytesEncoder,
+                        )
+                        f.write("\n")
 
                 cassette.append = streaming_append
                 # Suppress the context-exit _save() — we write directly to temp_path
@@ -456,7 +482,8 @@ class VCRRecorder:
                             continue
                         if not first:
                             out.write(",\n")
-                        out.write("    " + json.dumps(json.loads(line), sort_keys=True))
+                        out.write("    ")
+                        out.write(line)
                         first = False
             out.write('\n  ],\n  "version": 1\n}\n')
 
