@@ -286,24 +286,33 @@ class VCRRecorder:
         vcr_context = self._vcr.use_cassette(str(self.cassette_path), record_mode="all")
 
         with vcr_context as cassette:
-            original_append = cassette.append
-
             def streaming_append(request, response):
-                # Let vcrpy apply sanitizers and deepcopy as normal
-                original_append(request, response)
-                # If the interaction passed all filters, it was added to cassette.data
-                if cassette.data:
-                    req, resp = cassette.data.pop()
-                    cassette.dirty = False
-                    interaction = {
-                        "request": compat.convert_to_unicode(req._to_dict()),
-                        "response": compat.convert_to_unicode(resp),
-                    }
-                    with open(temp_path, "a") as f:
-                        f.write(json.dumps(interaction) + "\n")
+                # Apply request filter directly — avoids copy.deepcopy inside original_append
+                filtered_request = self._before_record_request(request)
+                if not filtered_request:
+                    return
+
+                # Shallow copy prevents our sanitizer from mutating the response dict
+                # that VCRHTTPResponse will return to the component.  The bytes object
+                # referenced by body["string"] is immutable, so sharing it is safe.
+                response_copy = {
+                    **response,
+                    "body": {**response.get("body", {})},
+                    "headers": dict(response.get("headers", {})),
+                }
+                filtered_response = self._before_record_response(response_copy)
+                if filtered_response is None:
+                    return
+
+                interaction = {
+                    "request": compat.convert_to_unicode(filtered_request._to_dict()),
+                    "response": compat.convert_to_unicode(filtered_response),
+                }
+                with open(temp_path, "a") as f:
+                    f.write(json.dumps(interaction) + "\n")
 
             cassette.append = streaming_append
-            # Suppress the context-exit _save() — cassette.data is empty by design
+            # Suppress the context-exit _save() — we write directly to temp_path
             cassette._save = lambda force=False: None
 
             if self.freeze_time_at and self.freeze_time_at != "auto":
@@ -312,25 +321,39 @@ class VCRRecorder:
             else:
                 component_runner()
 
-        self._build_cassette_from_jsonl(temp_path)
-        temp_path.unlink(missing_ok=True)
+        from datetime import datetime, timezone
 
-        self._inject_metadata()
+        metadata = {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "freeze_time": self.freeze_time_at,
+            "keboola_vcr_version": self._get_version(),
+        }
+        self._build_cassette_from_jsonl(temp_path, metadata)
+        temp_path.unlink(missing_ok=True)
         logger.info(f"Recorded cassette to {self.cassette_path}")
 
-    def _build_cassette_from_jsonl(self, temp_path: Path) -> None:
-        """Reconstruct the cassette JSON from the streaming JSONL temp file."""
-        interactions = []
-        if temp_path.exists():
-            with open(temp_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        interactions.append(json.loads(line))
+    def _build_cassette_from_jsonl(self, temp_path: Path, metadata: dict) -> None:
+        """Stream-write the cassette JSON from the JSONL temp file with inline metadata.
 
-        cassette_data = {"version": 1, "interactions": interactions}
-        with open(self.cassette_path, "w") as f:
-            json.dump(cassette_data, f, indent=2, sort_keys=True)
+        Writes the output file line-by-line to avoid loading all interactions into
+        memory at once (avoids a secondary OOM spike after recording finishes).
+        """
+        with open(self.cassette_path, "w") as out:
+            out.write("{\n")
+            out.write('  "_metadata": ' + json.dumps(metadata, sort_keys=True) + ",\n")
+            out.write('  "interactions": [\n')
+            first = True
+            if temp_path.exists():
+                with open(temp_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if not first:
+                            out.write(",\n")
+                        out.write("    " + json.dumps(json.loads(line), sort_keys=True))
+                        first = False
+            out.write('\n  ],\n  "version": 1\n}\n')
 
     def replay(self, component_runner: Callable[[], None]) -> None:
         """
@@ -455,25 +478,6 @@ class VCRRecorder:
             cassette_file=f"vcr_debug_{component_id}_{config_id}_{timestamp}.json",
         )
         recorder.record(component_runner)
-
-    def _inject_metadata(self) -> None:
-        """Inject _metadata into cassette file after recording."""
-        from datetime import datetime, timezone
-
-        if not self.cassette_path.exists():
-            return
-
-        with open(self.cassette_path, "r") as f:
-            cassette = json.load(f)
-
-        cassette["_metadata"] = {
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "freeze_time": self.freeze_time_at,
-            "keboola_vcr_version": self._get_version(),
-        }
-
-        with open(self.cassette_path, "w") as f:
-            json.dump(cassette, f, indent=2, sort_keys=True)
 
     @staticmethod
     def load_metadata(cassette_path: Path) -> Dict[str, Any]:
