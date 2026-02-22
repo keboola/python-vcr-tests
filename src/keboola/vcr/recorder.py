@@ -286,7 +286,7 @@ class VCRRecorder:
         # (replay cassettes may reuse the same recorded_response dict multiple times,
         # so we must not mutate it there).
         _original_vcr_init = _VCRHTTPResponse.__init__
-        _VCRHTTPResponse.__init__ = functools.partial(_zero_copy_vcr_response_init, original_init=_original_vcr_init)
+        _VCRHTTPResponse.__init__ = functools.partialmethod(_zero_copy_vcr_response_init, original_init=_original_vcr_init)
 
         vcr_context = self._vcr.use_cassette(str(self.cassette_path), record_mode="all")
 
