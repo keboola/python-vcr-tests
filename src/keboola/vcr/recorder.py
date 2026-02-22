@@ -267,36 +267,70 @@ class VCRRecorder:
         """
         Record HTTP interactions while running component.
 
-        This will:
-        1. Create the cassette directory if needed
-        2. Freeze time to the configured timestamp
-        3. Run the component while recording HTTP interactions
-        4. Save the sanitized cassette
+        Each interaction is serialized and streamed to a temporary JSONL file
+        immediately after being captured, then removed from vcrpy's in-memory
+        buffer. This keeps memory usage constant regardless of job size.
+        The final cassette JSON is reconstructed from the temp file at the end.
 
         Args:
             component_runner: Callable that runs the component
         """
-        # Ensure cassette directory exists
-        self.cassette_dir.mkdir(parents=True, exist_ok=True)
+        from vcr.serializers import compat
 
+        self.cassette_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Recording HTTP interactions to {self.cassette_path}")
 
-        # Run with time freezing and VCR recording
-        vcr_context = self._vcr.use_cassette(
-            str(self.cassette_path),
-            record_mode="all",
-        )
+        temp_path = self.cassette_path.with_suffix(".jsonl.tmp")
+        temp_path.unlink(missing_ok=True)
 
-        if self.freeze_time_at and self.freeze_time_at != "auto":
-            with freeze_time(self.freeze_time_at):
-                with vcr_context:
+        vcr_context = self._vcr.use_cassette(str(self.cassette_path), record_mode="all")
+
+        with vcr_context as cassette:
+            original_append = cassette.append
+
+            def streaming_append(request, response):
+                # Let vcrpy apply sanitizers and deepcopy as normal
+                original_append(request, response)
+                # If the interaction passed all filters, it was added to cassette.data
+                if cassette.data:
+                    req, resp = cassette.data.pop()
+                    cassette.dirty = False
+                    interaction = {
+                        "request": compat.convert_to_unicode(req._to_dict()),
+                        "response": compat.convert_to_unicode(resp),
+                    }
+                    with open(temp_path, "a") as f:
+                        f.write(json.dumps(interaction) + "\n")
+
+            cassette.append = streaming_append
+            # Suppress the context-exit _save() — cassette.data is empty by design
+            cassette._save = lambda force=False: None
+
+            if self.freeze_time_at and self.freeze_time_at != "auto":
+                with freeze_time(self.freeze_time_at):
                     component_runner()
-        else:
-            with vcr_context:
+            else:
                 component_runner()
+
+        self._build_cassette_from_jsonl(temp_path)
+        temp_path.unlink(missing_ok=True)
 
         self._inject_metadata()
         logger.info(f"Recorded cassette to {self.cassette_path}")
+
+    def _build_cassette_from_jsonl(self, temp_path: Path) -> None:
+        """Reconstruct the cassette JSON from the streaming JSONL temp file."""
+        interactions = []
+        if temp_path.exists():
+            with open(temp_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        interactions.append(json.loads(line))
+
+        cassette_data = {"version": 1, "interactions": interactions}
+        with open(self.cassette_path, "w") as f:
+            json.dump(cassette_data, f, indent=2, sort_keys=True)
 
     def replay(self, component_runner: Callable[[], None]) -> None:
         """
@@ -417,7 +451,7 @@ class VCRRecorder:
             cassette_dir=output_dir,
             sanitizers=chain,
             record_mode="all",
-            freeze_time_at=None,
+            freeze_time_at=timestamp,
             cassette_file=f"vcr_debug_{component_id}_{config_id}_{timestamp}.json",
         )
         recorder.record(component_runner)
