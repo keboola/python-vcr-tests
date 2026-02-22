@@ -53,9 +53,12 @@ class _VCRRecordingReader:
         if n is None or n < 0:
             chunk = self._data[self._pos :]
             self._pos = len(self._data)
+            self._data = b""  # release: caller (urllib3/requests) now owns the only copy
         else:
             chunk = self._data[self._pos : self._pos + n]
             self._pos += len(chunk)
+            if self._pos >= len(self._data):
+                self._data = b""  # release after chunked reads reach the end
         return chunk
 
     def read1(self, n: int = -1) -> bytes:
