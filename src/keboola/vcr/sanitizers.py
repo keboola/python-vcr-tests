@@ -149,8 +149,9 @@ class DefaultSanitizer(BaseSanitizer):
         # 1. Try JSON
         try:
             data = json.loads(body)
-            sanitized = self._sanitize_json_value(data)
-            if sanitized == data:
+            changed = [False]
+            sanitized = self._sanitize_json_value(data, changed)
+            if not changed[0]:
                 return body  # no changes → preserve original formatting
             return json.dumps(sanitized)
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -167,24 +168,37 @@ class DefaultSanitizer(BaseSanitizer):
                 result = result.replace(value, self.replacement)
         return result
 
-    def _sanitize_json_value(self, data: Any) -> Any:
-        """Recursively sanitize JSON data by field name and known values."""
+    def _sanitize_json_value(self, data: Any, changed: list[bool] | None = None) -> Any:
+        """Recursively sanitize JSON data by field name and known values.
+
+        Args:
+            data: The JSON value to sanitize.
+            changed: Single-element list used as a mutable flag.  Set to
+                ``[True]`` by the caller; this method sets ``changed[0] = True``
+                the first time any substitution is made.  When ``None`` (default,
+                used by callers that do not need change tracking) the flag is
+                simply not updated.
+        """
         if isinstance(data, dict):
             result = {}
             for key, value in data.items():
                 if key in self.sensitive_fields:
                     result[key] = self.replacement
+                    if changed is not None:
+                        changed[0] = True
                 else:
-                    result[key] = self._sanitize_json_value(value)
+                    result[key] = self._sanitize_json_value(value, changed)
             return result
         elif isinstance(data, list):
-            return [self._sanitize_json_value(item) for item in data]
+            return [self._sanitize_json_value(item, changed) for item in data]
         elif isinstance(data, str):
             # Replace known secret values in string fields (catches embedded tokens)
             result = data
             for value in self.sensitive_values:
                 if value in result:
                     result = result.replace(value, self.replacement)
+                    if changed is not None:
+                        changed[0] = True
             return result
         return data
 

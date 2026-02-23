@@ -288,6 +288,10 @@ class VCRRecorder:
         # the original bytes without copying.  The patch is scoped to recording only
         # (replay cassettes may reuse the same recorded_response dict multiple times,
         # so we must not mutate it there).
+        # NOTE: this patch is global (class-level), not instance-level.  Two
+        # VCRRecorder instances calling record() concurrently would race here.
+        # Single-threaded component execution is assumed; do not call record()
+        # from multiple threads simultaneously.
         _original_vcr_init = _VCRHTTPResponse.__init__
         _VCRHTTPResponse.__init__ = functools.partialmethod(_zero_copy_vcr_response_init, original_init=_original_vcr_init)
 
@@ -312,8 +316,10 @@ class VCRRecorder:
             "freeze_time": self.freeze_time_at,
             "keboola_vcr_version": self._get_version(),
         }
-        self._write_cassette(temp_path, metadata)
-        temp_path.unlink(missing_ok=True)
+        try:
+            self._write_cassette(temp_path, metadata)
+        finally:
+            temp_path.unlink(missing_ok=True)
         logger.info(f"Recorded cassette to {self.cassette_path}")
 
     def replay(self, component_runner: Callable[[], None]) -> None:
@@ -410,6 +416,7 @@ class VCRRecorder:
                 {"request": filtered_request._to_dict(), "response": filtered_response},
                 f,
                 cls=_BytesEncoder,
+                sort_keys=True,
             )
             f.write("\n")
 
@@ -689,6 +696,13 @@ def _zero_copy_vcr_response_init(self_resp, recorded_response, *, original_init)
     """
     body = recorded_response.get("body", {})
     original_bytes = body.pop("string", b"")
+    # CRITICAL — memory overhead guard: do not change this to the original bytes.
+    # We give vcrpy an empty placeholder so that original_init() wraps b"" in
+    # BytesIO (a zero-byte allocation) rather than BytesIO(original_bytes) which
+    # would copy every response body into a second buffer.  After init completes
+    # we replace _content with a _VCRRecordingReader that wraps original_bytes
+    # directly.  Removing or reordering these three lines re-introduces the 2×
+    # memory overhead that this function was created to eliminate.
     body["string"] = b""
     original_init(self_resp, recorded_response)
     self_resp._content = _VCRRecordingReader(original_bytes)
