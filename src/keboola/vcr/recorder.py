@@ -299,7 +299,14 @@ class VCRRecorder:
 
         try:
             with vcr_context as cassette:
-                cassette.append = functools.partial(self._append_interaction, temp_path)
+                # Capture the cassette's full filter chain so that vcrpy's built-in
+                # decode_compressed_response hook (and our sanitizer) both run inside
+                # _append_interaction.  Without this, patching cassette.append would
+                # bypass the chain, leaving gzip response bodies un-decompressed in
+                # the cassette.
+                cassette.append = functools.partial(
+                    self._append_interaction, temp_path, cassette._before_record_response
+                )
                 # Suppress the context-exit _save() — we write directly to temp_path
                 cassette._save = lambda force=False: None
 
@@ -392,7 +399,7 @@ class VCRRecorder:
             data = json.load(f)
         return data.get("_metadata", {})
 
-    def _append_interaction(self, temp_path: Path, request, response) -> None:
+    def _append_interaction(self, temp_path: Path, cassette_before_record_response, request, response) -> None:
         """Serialize a single recorded interaction to the JSONL temp file."""
         # Apply request filter directly — avoids copy.deepcopy inside original_append
         filtered_request = self._before_record_request(request)
@@ -407,7 +414,11 @@ class VCRRecorder:
             "body": {**response.get("body", {})},
             "headers": dict(response.get("headers", {})),
         }
-        filtered_response = self._before_record_response(response_copy)
+        # Run the cassette's full before_record_response chain, which includes
+        # vcrpy's built-in decode_compressed_response hook followed by our
+        # sanitizer.  Calling our _before_record_response alone would skip the
+        # decompression step, leaving gzip bodies un-decompressed in cassettes.
+        filtered_response = cassette_before_record_response(response_copy)
         if filtered_response is None:
             return
 
