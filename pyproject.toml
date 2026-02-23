@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "vcrpy>=8.1.1,<9",  # cassette._save and cassette.append are private API we depend on
-    "freezegun>=1.0.0",
+    "freezegun>=1.5.5,<2",
 ]
 
 [project.urls]
