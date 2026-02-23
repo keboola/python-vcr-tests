@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 from runpy import run_path
 from typing import Any
@@ -64,7 +65,7 @@ class TestScaffolder:
         output_dir: Path,
         component_script: Path | None = None,
         record: bool = True,
-        freeze_time_at: str | None = "2025-01-01T12:00:00",
+        freeze_time_at: str | None = None,
         secrets_file: Path | None = None,
         chain_state: bool = False,
     ) -> list[Path]:
@@ -106,6 +107,10 @@ class TestScaffolder:
 
         if record and component_script is None:
             raise ScaffolderError("component_script is required when record=True")
+
+        # Default freeze time to the current moment so replays match recording conditions
+        if freeze_time_at is None:
+            freeze_time_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
         # Auto-detect raw Keboola configs and transform
         definitions = self._normalize_definitions(definitions)
@@ -151,7 +156,7 @@ class TestScaffolder:
         output_dir: Path,
         component_script: Path | None = None,
         record: bool = True,
-        freeze_time_at: str | None = "2025-01-01T12:00:00",
+        freeze_time_at: str | None = None,
         secrets_override: dict[str, Any] | None = None,
     ) -> Path:
         """
@@ -455,7 +460,7 @@ def scaffold_tests(
     output_dir: Path,
     component_script: Path | None = None,
     record: bool = True,
-    freeze_time_at: str | None = "2025-01-01T12:00:00",
+    freeze_time_at: str | None = None,
     secrets_override: dict[str, Any] | None = None,
 ) -> list[Path]:
     """
