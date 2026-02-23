@@ -8,14 +8,12 @@ version = "0.1.0"
 description = "VCR recording, sanitization, and validation for Keboola component HTTP interactions"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -24,6 +22,12 @@ classifiers = [
 dependencies = [
     "vcrpy>=8.1.1,<9",  # cassette._save and cassette.append are private API we depend on
     "freezegun>=1.5.5,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
 ]
 
 [project.urls]
