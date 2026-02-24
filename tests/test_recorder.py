@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -150,6 +149,7 @@ class TestJsonIndentedSerializer:
         raw = bytes([0xFF, 0xFE])
         result = enc.default(raw)
         import base64
+
         assert result == base64.b64encode(raw).decode("ascii")
 
 

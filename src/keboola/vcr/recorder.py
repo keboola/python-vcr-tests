@@ -293,7 +293,9 @@ class VCRRecorder:
         # Single-threaded component execution is assumed; do not call record()
         # from multiple threads simultaneously.
         _original_vcr_init = _VCRHTTPResponse.__init__
-        _VCRHTTPResponse.__init__ = functools.partialmethod(_zero_copy_vcr_response_init, original_init=_original_vcr_init)
+        _VCRHTTPResponse.__init__ = functools.partialmethod(
+            _zero_copy_vcr_response_init, original_init=_original_vcr_init
+        )
 
         vcr_context = self._vcr.use_cassette(str(self.cassette_path), record_mode="all")
 

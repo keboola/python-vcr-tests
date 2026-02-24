@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-import pytest
-
 from keboola.vcr.sanitizers import (
     BodyFieldSanitizer,
     CallbackSanitizer,
@@ -338,7 +336,7 @@ class TestQueryParamSanitizer:
 
     def test_response_body_sanitized(self):
         s = QueryParamSanitizer(parameters=["access_token"])
-        resp = _make_response(b'https://cdn.example.com/img?access_token=secret&other=ok')
+        resp = _make_response(b"https://cdn.example.com/img?access_token=secret&other=ok")
         result = s.before_record_response(resp)
         assert b"secret" not in result["body"]["string"]
 
@@ -357,10 +355,12 @@ class TestUrlPatternSanitizer:
         assert "ACCOUNT_ID" in result.uri
 
     def test_multiple_patterns(self):
-        s = UrlPatternSanitizer(patterns=[
-            (r"/users/\d+", "/users/USER_ID"),
-            (r"/orgs/\w+", "/orgs/ORG_ID"),
-        ])
+        s = UrlPatternSanitizer(
+            patterns=[
+                (r"/users/\d+", "/users/USER_ID"),
+                (r"/orgs/\w+", "/orgs/ORG_ID"),
+            ]
+        )
         req = _make_request(uri="https://api.example.com/users/42/orgs/acme")
         result = s.before_record_request(req)
         assert "42" not in result.uri

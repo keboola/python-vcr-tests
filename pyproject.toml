@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"
 
 [project]
 name = "keboola.vcr"
@@ -35,10 +35,6 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/keboola/python-vcr-tests"
 Repository = "https://github.com/keboola/python-vcr-tests"
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["keboola.vcr*"]
 
 [[tool.uv.index]]
 name = "testpypi"
