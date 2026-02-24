@@ -6,12 +6,29 @@ on:
       - main
 
 jobs:
-  test:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.13"]
+    steps:
+      - name: Checkout 🛒
+        uses: actions/checkout@v4
 
+      - name: Install and run ruff 🐶
+        uses: astral-sh/ruff-action@v3
+
+      - name: Install uv 💜
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies 📦
+        run: uv sync --all-groups --frozen
+
+      - name: Lint with flake8 ❄️
+        run: uv run flake8
+
+  test-310:
+    name: Test (Python 3.10)
+    runs-on: ubuntu-latest
+    needs: lint
     steps:
       - name: Checkout 🛒
         uses: actions/checkout@v4
@@ -19,19 +36,35 @@ jobs:
       - name: Install uv 💜
         uses: astral-sh/setup-uv@v6
 
-      - name: Install and run ruff 🐶
-        uses: astral-sh/ruff-action@v3
-
-      - name: Set up Python ${{ matrix.python-version }} 🐍
+      - name: Set up Python 3.10 🐍
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.10"
 
       - name: Install dependencies 📦
         run: uv sync --all-groups --frozen
 
-      - name: Lint with flake8 ❄️
-        run: uv run flake8
+      - name: Test with pytest ✅
+        run: uv run pytest tests/
+
+  test-313:
+    name: Test (Python 3.13)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout 🛒
+        uses: actions/checkout@v4
+
+      - name: Install uv 💜
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python 3.13 🐍
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies 📦
+        run: uv sync --all-groups --frozen
 
       - name: Test with pytest ✅
         run: uv run pytest tests/

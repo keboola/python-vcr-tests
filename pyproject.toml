@@ -36,6 +36,9 @@ dev = [
 Homepage = "https://github.com/keboola/python-vcr-tests"
 Repository = "https://github.com/keboola/python-vcr-tests"
 
+[tool.uv.build-backend]
+module-name = "keboola.vcr"
+
 [[tool.uv.index]]
 name = "testpypi"
 url = "https://test.pypi.org/simple/"
