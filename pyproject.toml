@@ -1,10 +1,6 @@
-[build-system]
-requires = ["uv_build>=0.10.0,<0.11.0"]
-build-backend = "uv_build"
-
 [project]
 name = "keboola.vcr"
-version = "0.1.0"
+version = "0.0.0"
 description = "VCR recording, sanitization, and validation for Keboola component HTTP interactions"
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,16 +24,12 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff>=0.1.0",
-    "flake8>=5.0.4",
+    "ruff>=0.1.0"
 ]
 
 [project.urls]
 Homepage = "https://github.com/keboola/python-vcr-tests"
 Repository = "https://github.com/keboola/python-vcr-tests"
-
-[tool.uv.build-backend]
-module-name = "keboola.vcr"
 
 [[tool.uv.index]]
 name = "testpypi"
@@ -47,6 +39,10 @@ explicit = true
 
 [tool.ruff]
 line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

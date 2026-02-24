@@ -1,9 +1,0 @@
-[flake8]
-exclude =
-    .git,
-    __pycache__,
-    tests,
-    example
-    .venv
-max-line-length = 120
-extend-ignore = E203
