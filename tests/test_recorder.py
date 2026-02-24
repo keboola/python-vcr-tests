@@ -16,7 +16,6 @@ from keboola.vcr.recorder import (
 )
 from keboola.vcr.sanitizers import CompositeSanitizer, DefaultSanitizer
 
-
 # ---------------------------------------------------------------------------
 # _VCRRecordingReader
 # ---------------------------------------------------------------------------

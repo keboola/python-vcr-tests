@@ -10,5 +10,3 @@ build/
 venv/
 .pytest_cache/
 .ruff_cache/
-*.lock
-!uv.lock
