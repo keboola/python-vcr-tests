@@ -8,7 +8,6 @@ import pytest
 
 from keboola.vcr.scaffolder import ScaffolderError, TestScaffolder, scaffold_tests
 
-
 # ---------------------------------------------------------------------------
 # TestScaffolder._generate_test_name
 # ---------------------------------------------------------------------------
