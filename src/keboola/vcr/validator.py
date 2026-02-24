@@ -6,35 +6,16 @@ on failure, allowing for efficient comparison of test outputs without
 storing full expected files.
 """
 
+from __future__ import annotations
+
 import csv
 import difflib
+import fnmatch
 import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-
-@dataclass
-class FileSnapshot:
-    """Snapshot information for a single file."""
-
-    path: str
-    hash: str
-    size_bytes: int
-    row_count: Optional[int] = None  # For CSV files
-    columns: Optional[List[str]] = None  # For CSV files
-
-
-@dataclass
-class ValidationDiff:
-    """Diff information for a single file validation failure."""
-
-    file_path: str
-    diff_type: str  # 'hash_mismatch', 'missing', 'unexpected', 'row_count', 'columns'
-    expected: Any
-    actual: Any
-    unified_diff: Optional[str] = None
+from typing import Any, Literal
 
 
 @dataclass
@@ -43,7 +24,7 @@ class ValidationResult:
 
     success: bool
     summary: str
-    diffs: List[ValidationDiff] = field(default_factory=list)
+    diffs: list[ValidationDiff] = field(default_factory=list)
 
     def format_output(self, verbose: bool = False) -> str:
         """
@@ -83,6 +64,28 @@ class ValidationResult:
         return "\n".join(lines)
 
 
+@dataclass
+class ValidationDiff:
+    """Diff information for a single file validation failure."""
+
+    file_path: str
+    diff_type: Literal["hash_mismatch", "missing", "unexpected"]
+    expected: Any
+    actual: Any
+    unified_diff: str | None = None
+
+
+@dataclass
+class FileSnapshot:
+    """Snapshot information for a single file."""
+
+    path: str
+    hash: str
+    size_bytes: int
+    row_count: int | None = None  # For CSV files
+    columns: list[str] | None = None  # For CSV files
+
+
 class OutputSnapshot:
     """
     Captures and validates output state using hash-based comparison.
@@ -99,7 +102,7 @@ class OutputSnapshot:
     def __init__(
         self,
         hash_algorithm: str = "sha256",
-        ignore_patterns: Optional[List[str]] = None,
+        ignore_patterns: list[str] | None = None,
     ):
         """
         Initialize output snapshot.
@@ -111,58 +114,71 @@ class OutputSnapshot:
         self.hash_algorithm = hash_algorithm
         self.ignore_patterns = ignore_patterns or [".DS_Store", ".gitkeep"]
 
-    def _should_ignore(self, filename: str) -> bool:
-        """Check if a file should be ignored based on patterns."""
-        import fnmatch
+    def validate(
+        self,
+        output_dir: Path,
+        expected: dict[str, Any],
+        expected_dir: Path | None = None,
+        verbose: bool = False,
+    ) -> ValidationResult:
+        """
+        Validate outputs against snapshot.
 
-        for pattern in self.ignore_patterns:
-            if fnmatch.fnmatch(filename, pattern):
-                return True
-        return False
+        Args:
+            output_dir: Directory containing actual output files
+            expected: Expected snapshot dictionary
+            expected_dir: Directory containing expected files (for diff generation)
+            verbose: If True, generate detailed diffs
 
-    def _hash_file(self, file_path: Path) -> str:
-        """Compute hash of a file."""
-        hasher = hashlib.new(self.hash_algorithm)
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                hasher.update(chunk)
-        return f"{self.hash_algorithm}:{hasher.hexdigest()}"
+        Returns:
+            ValidationResult with success status and any differences
+        """
+        actual = self.capture(output_dir)
+        diffs: list[ValidationDiff] = []
 
-    def _get_csv_metadata(self, file_path: Path) -> Tuple[Optional[int], Optional[List[str]]]:
-        """Extract metadata from a CSV file."""
-        try:
-            with open(file_path, "r", newline="", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                try:
-                    header = next(reader)
-                except StopIteration:
-                    return 0, []
-
-                row_count = sum(1 for _ in reader) + 1  # +1 for header
-                return row_count, header
-        except Exception:
-            return None, None
-
-    def _snapshot_file(self, file_path: Path, base_dir: Path) -> FileSnapshot:
-        """Create snapshot for a single file."""
-        rel_path = str(file_path.relative_to(base_dir))
-        stat = file_path.stat()
-
-        snapshot = FileSnapshot(
-            path=rel_path,
-            hash=self._hash_file(file_path),
-            size_bytes=stat.st_size,
+        # Compare tables
+        tables_diff = self._compare_section(
+            expected.get("tables", {}),
+            actual.get("tables", {}),
+            "tables",
+            output_dir / "tables",
+            expected_dir / "tables" if expected_dir else None,
+            verbose,
         )
+        diffs.extend(tables_diff)
 
-        # Add CSV-specific metadata
-        if file_path.suffix.lower() == ".csv":
-            row_count, columns = self._get_csv_metadata(file_path)
-            snapshot.row_count = row_count
-            snapshot.columns = columns
+        # Compare files
+        files_diff = self._compare_section(
+            expected.get("files", {}),
+            actual.get("files", {}),
+            "files",
+            output_dir / "files",
+            expected_dir / "files" if expected_dir else None,
+            verbose,
+        )
+        diffs.extend(files_diff)
 
-        return snapshot
+        # Generate summary
+        if not diffs:
+            return ValidationResult(success=True, summary="All outputs match expected snapshot")
 
-    def capture(self, output_dir: Path) -> Dict[str, Any]:
+        missing = len([d for d in diffs if d.diff_type == "missing"])
+        unexpected = len([d for d in diffs if d.diff_type == "unexpected"])
+        changed = len([d for d in diffs if d.diff_type == "hash_mismatch"])
+
+        parts = []
+        if changed:
+            parts.append(f"{changed} file{'s' if changed != 1 else ''} changed")
+        if missing:
+            parts.append(f"{missing} file{'s' if missing != 1 else ''} missing")
+        if unexpected:
+            parts.append(f"{unexpected} unexpected file{'s' if unexpected != 1 else ''}")
+
+        summary = "Validation failed: " + ", ".join(parts)
+
+        return ValidationResult(success=False, summary=summary, diffs=diffs)
+
+    def capture(self, output_dir: Path) -> dict[str, Any]:
         """
         Capture snapshot of outputs (hashes + metadata).
 
@@ -207,7 +223,7 @@ class OutputSnapshot:
 
         return snapshot
 
-    def save(self, snapshot: Dict[str, Any], snapshot_path: Path) -> None:
+    def save(self, snapshot: dict[str, Any], snapshot_path: Path) -> None:
         """
         Save snapshot to JSON file.
 
@@ -218,7 +234,7 @@ class OutputSnapshot:
         with open(snapshot_path, "w") as f:
             json.dump(snapshot, f, indent=2, sort_keys=True)
 
-    def load(self, snapshot_path: Path) -> Dict[str, Any]:
+    def load(self, snapshot_path: Path) -> dict[str, Any]:
         """
         Load snapshot from JSON file.
 
@@ -234,110 +250,17 @@ class OutputSnapshot:
         with open(snapshot_path, "r") as f:
             return json.load(f)
 
-    def _generate_file_diff(
-        self,
-        expected_path: Path,
-        actual_path: Path,
-    ) -> Optional[str]:
-        """Generate unified diff between two files."""
-        try:
-            with open(expected_path, "r", encoding="utf-8") as f:
-                expected_lines = f.readlines()
-            with open(actual_path, "r", encoding="utf-8") as f:
-                actual_lines = f.readlines()
-
-            diff = list(
-                difflib.unified_diff(
-                    expected_lines,
-                    actual_lines,
-                    fromfile=str(expected_path),
-                    tofile=str(actual_path),
-                    lineterm="",
-                )
-            )
-
-            if diff:
-                return "\n".join(diff)
-        except Exception:
-            pass
-
-        return None
-
-    def validate(
-        self,
-        output_dir: Path,
-        expected: Dict[str, Any],
-        expected_dir: Optional[Path] = None,
-        verbose: bool = False,
-    ) -> ValidationResult:
-        """
-        Validate outputs against snapshot.
-
-        Args:
-            output_dir: Directory containing actual output files
-            expected: Expected snapshot dictionary
-            expected_dir: Directory containing expected files (for diff generation)
-            verbose: If True, generate detailed diffs
-
-        Returns:
-            ValidationResult with success status and any differences
-        """
-        actual = self.capture(output_dir)
-        diffs: List[ValidationDiff] = []
-
-        # Compare tables
-        tables_diff = self._compare_section(
-            expected.get("tables", {}),
-            actual.get("tables", {}),
-            "tables",
-            output_dir / "tables",
-            expected_dir / "tables" if expected_dir else None,
-            verbose,
-        )
-        diffs.extend(tables_diff)
-
-        # Compare files
-        files_diff = self._compare_section(
-            expected.get("files", {}),
-            actual.get("files", {}),
-            "files",
-            output_dir / "files",
-            expected_dir / "files" if expected_dir else None,
-            verbose,
-        )
-        diffs.extend(files_diff)
-
-        # Generate summary
-        if not diffs:
-            return ValidationResult(success=True, summary="All outputs match expected snapshot")
-
-        missing = len([d for d in diffs if d.diff_type == "missing"])
-        unexpected = len([d for d in diffs if d.diff_type == "unexpected"])
-        changed = len([d for d in diffs if d.diff_type == "hash_mismatch"])
-
-        parts = []
-        if changed:
-            parts.append(f"{changed} file{'s' if changed != 1 else ''} changed")
-        if missing:
-            parts.append(f"{missing} file{'s' if missing != 1 else ''} missing")
-        if unexpected:
-            parts.append(f"{unexpected} unexpected file{'s' if unexpected != 1 else ''}")
-
-        summary = "Validation failed: " + ", ".join(parts)
-
-        return ValidationResult(success=False, summary=summary, diffs=diffs)
-
     def _compare_section(
         self,
-        expected: Dict[str, Any],
-        actual: Dict[str, Any],
+        expected: dict[str, Any],
+        actual: dict[str, Any],
         section_name: str,
         actual_base_dir: Path,
-        expected_base_dir: Optional[Path],
+        expected_base_dir: Path | None,
         verbose: bool,
-    ) -> List[ValidationDiff]:
+    ) -> list[ValidationDiff]:
         """Compare a section (tables or files) of the snapshot."""
-        diffs: List[ValidationDiff] = []
+        diffs: list[ValidationDiff] = []
 
         expected_paths = set(expected.keys())
         actual_paths = set(actual.keys())
@@ -389,24 +312,113 @@ class OutputSnapshot:
 
         return diffs
 
+    def _snapshot_file(self, file_path: Path, base_dir: Path) -> FileSnapshot:
+        """Create snapshot for a single file."""
+        rel_path = str(file_path.relative_to(base_dir))
+        stat = file_path.stat()
 
-def capture_output_snapshot(
+        snapshot = FileSnapshot(
+            path=rel_path,
+            hash=self._hash_file(file_path),
+            size_bytes=stat.st_size,
+        )
+
+        # Add CSV-specific metadata
+        if file_path.suffix.lower() == ".csv":
+            row_count, columns = self._get_csv_metadata(file_path)
+            snapshot.row_count = row_count
+            snapshot.columns = columns
+
+        return snapshot
+
+    def _generate_file_diff(
+        self,
+        expected_path: Path,
+        actual_path: Path,
+    ) -> str | None:
+        """Generate unified diff between two files."""
+        try:
+            with open(expected_path, "r", encoding="utf-8") as f:
+                expected_lines = f.readlines()
+            with open(actual_path, "r", encoding="utf-8") as f:
+                actual_lines = f.readlines()
+
+            diff = list(
+                difflib.unified_diff(
+                    expected_lines,
+                    actual_lines,
+                    fromfile=str(expected_path),
+                    tofile=str(actual_path),
+                    lineterm="",
+                )
+            )
+
+            if diff:
+                return "\n".join(diff)
+        except Exception:
+            pass
+
+        return None
+
+    def _get_csv_metadata(self, file_path: Path) -> tuple[int | None, list[str] | None]:
+        """Extract metadata from a CSV file."""
+        try:
+            with open(file_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    return 0, []
+
+                row_count = sum(1 for _ in reader) + 1  # +1 for header
+                return row_count, header
+        except Exception:
+            return None, None
+
+    def _hash_file(self, file_path: Path) -> str:
+        """Compute hash of a file."""
+        hasher = hashlib.new(self.hash_algorithm)
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hasher.update(chunk)
+        return f"{self.hash_algorithm}:{hasher.hexdigest()}"
+
+    def _should_ignore(self, filename: str) -> bool:
+        """Check if a file should be ignored based on patterns."""
+        for pattern in self.ignore_patterns:
+            if fnmatch.fnmatch(filename, pattern):
+                return True
+        return False
+
+
+def validate_output_snapshot(
     test_data_dir: Path,
     output_subdir: str = "out",
-) -> Dict[str, Any]:
+    snapshot_file: str = OutputSnapshot.SNAPSHOT_FILE,
+    expected_dir: Path | None = None,
+    verbose: bool = False,
+) -> ValidationResult:
     """
-    Convenience function to capture and return output snapshot.
+    Convenience function to validate outputs against saved snapshot.
 
     Args:
         test_data_dir: Path to test's data directory
-        output_subdir: Subdirectory containing outputs (default: 'out')
+        output_subdir: Subdirectory containing outputs
+        snapshot_file: Name of snapshot file to load
+        expected_dir: Directory with expected files for diff generation
+        verbose: Include detailed diffs in result
 
     Returns:
-        Snapshot dictionary
+        ValidationResult
     """
-    output_dir = Path(test_data_dir) / output_subdir
+    test_data_dir = Path(test_data_dir)
+    output_dir = test_data_dir / output_subdir
+    snapshot_path = test_data_dir / snapshot_file
+
     snapshot = OutputSnapshot()
-    return snapshot.capture(output_dir)
+    expected = snapshot.load(snapshot_path)
+
+    return snapshot.validate(output_dir, expected, expected_dir, verbose)
 
 
 def save_output_snapshot(
@@ -437,31 +449,20 @@ def save_output_snapshot(
     return snapshot_path
 
 
-def validate_output_snapshot(
+def capture_output_snapshot(
     test_data_dir: Path,
     output_subdir: str = "out",
-    snapshot_file: str = OutputSnapshot.SNAPSHOT_FILE,
-    expected_dir: Optional[Path] = None,
-    verbose: bool = False,
-) -> ValidationResult:
+) -> dict[str, Any]:
     """
-    Convenience function to validate outputs against saved snapshot.
+    Convenience function to capture and return output snapshot.
 
     Args:
         test_data_dir: Path to test's data directory
-        output_subdir: Subdirectory containing outputs
-        snapshot_file: Name of snapshot file to load
-        expected_dir: Directory with expected files for diff generation
-        verbose: Include detailed diffs in result
+        output_subdir: Subdirectory containing outputs (default: 'out')
 
     Returns:
-        ValidationResult
+        Snapshot dictionary
     """
-    test_data_dir = Path(test_data_dir)
-    output_dir = test_data_dir / output_subdir
-    snapshot_path = test_data_dir / snapshot_file
-
+    output_dir = Path(test_data_dir) / output_subdir
     snapshot = OutputSnapshot()
-    expected = snapshot.load(snapshot_path)
-
-    return snapshot.validate(output_dir, expected, expected_dir, verbose)
+    return snapshot.capture(output_dir)
