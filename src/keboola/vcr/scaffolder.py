@@ -72,7 +72,6 @@ class TestScaffolder:
         secrets_file: Path | None = None,
         chain_state: bool = False,
         regenerate: bool = False,
-        add_missing: bool = False,
     ) -> list[Path]:
         """
         Create test folders from definitions file.
@@ -89,11 +88,8 @@ class TestScaffolder:
             chain_state: Forward out/state.json from each test as
                 in/state.json for the next test (for ERP token refresh).
             regenerate: Delete existing cassettes before recording so fresh
-                interactions are captured from the live API.  Takes precedence
-                over *add_missing*.
-            add_missing: Skip tests that already have a cassette; only record
-                tests whose cassette file is absent.  Ignored when *regenerate*
-                is True.
+                interactions are captured from the live API.  When False,
+                tests that already have a cassette are skipped.
 
         Returns:
             List of created test folder paths
@@ -150,7 +146,6 @@ class TestScaffolder:
                 secrets_override=secrets_override,
                 input_state=chained_state,
                 regenerate=regenerate,
-                add_missing=add_missing,
             )
             created_paths.append(test_path)
 
@@ -172,7 +167,6 @@ class TestScaffolder:
         freeze_time_at: str | None = None,
         secrets_override: dict[str, Any] | None = None,
         regenerate: bool = False,
-        add_missing: bool = False,
     ) -> Path:
         """
         Create a single test folder from a definition dict.
@@ -184,8 +178,8 @@ class TestScaffolder:
             record: Whether to run component and record cassette
             freeze_time_at: ISO timestamp for time freezing
             secrets_override: Optional dict of secrets to deep-merge at recording time
-            regenerate: Delete existing cassette before recording
-            add_missing: Skip recording if cassette already exists
+            regenerate: Delete existing cassette before recording; when False,
+                existing cassettes are skipped.
 
         Returns:
             Path to created test folder
@@ -198,7 +192,6 @@ class TestScaffolder:
             freeze_time_at=freeze_time_at,
             secrets_override=secrets_override,
             regenerate=regenerate,
-            add_missing=add_missing,
         )
 
     # ------------------------------------------------------------------
@@ -215,7 +208,6 @@ class TestScaffolder:
         secrets_override: dict[str, Any] | None = None,
         input_state: dict[str, Any] | None = None,
         regenerate: bool = False,
-        add_missing: bool = False,
     ) -> Path:
         """Create folder structure for a single test."""
         # Validate definition
@@ -262,7 +254,7 @@ class TestScaffolder:
         # Record cassette if requested
         if record and component_script:
             cassette_path = source_data_dir / "cassettes" / VCRRecorder.DEFAULT_CASSETTE_FILE
-            if add_missing and not regenerate and cassette_path.exists():
+            if not regenerate and cassette_path.exists():
                 logger.info(f"Skipping {test_name} — cassette exists (use --regenerate to force)")
             else:
                 self._record_test(
