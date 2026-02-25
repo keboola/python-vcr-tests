@@ -30,6 +30,9 @@ from pathlib import Path
 from runpy import run_path
 from typing import Any
 
+from .recorder import VCRRecorder
+from .validator import save_output_snapshot
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +71,8 @@ class TestScaffolder:
         freeze_time_at: str | None = None,
         secrets_file: Path | None = None,
         chain_state: bool = False,
+        regenerate: bool = False,
+        add_missing: bool = False,
     ) -> list[Path]:
         """
         Create test folders from definitions file.
@@ -83,6 +88,12 @@ class TestScaffolder:
                 whose keys are deep-merged into each config.
             chain_state: Forward out/state.json from each test as
                 in/state.json for the next test (for ERP token refresh).
+            regenerate: Delete existing cassettes before recording so fresh
+                interactions are captured from the live API.  Takes precedence
+                over *add_missing*.
+            add_missing: Skip tests that already have a cassette; only record
+                tests whose cassette file is absent.  Ignored when *regenerate*
+                is True.
 
         Returns:
             List of created test folder paths
@@ -138,6 +149,8 @@ class TestScaffolder:
                 freeze_time_at=freeze_time_at,
                 secrets_override=secrets_override,
                 input_state=chained_state,
+                regenerate=regenerate,
+                add_missing=add_missing,
             )
             created_paths.append(test_path)
 
@@ -158,6 +171,8 @@ class TestScaffolder:
         record: bool = True,
         freeze_time_at: str | None = None,
         secrets_override: dict[str, Any] | None = None,
+        regenerate: bool = False,
+        add_missing: bool = False,
     ) -> Path:
         """
         Create a single test folder from a definition dict.
@@ -169,6 +184,8 @@ class TestScaffolder:
             record: Whether to run component and record cassette
             freeze_time_at: ISO timestamp for time freezing
             secrets_override: Optional dict of secrets to deep-merge at recording time
+            regenerate: Delete existing cassette before recording
+            add_missing: Skip recording if cassette already exists
 
         Returns:
             Path to created test folder
@@ -180,6 +197,8 @@ class TestScaffolder:
             record=record,
             freeze_time_at=freeze_time_at,
             secrets_override=secrets_override,
+            regenerate=regenerate,
+            add_missing=add_missing,
         )
 
     # ------------------------------------------------------------------
@@ -195,6 +214,8 @@ class TestScaffolder:
         freeze_time_at: str | None,
         secrets_override: dict[str, Any] | None = None,
         input_state: dict[str, Any] | None = None,
+        regenerate: bool = False,
+        add_missing: bool = False,
     ) -> Path:
         """Create folder structure for a single test."""
         # Validate definition
@@ -240,15 +261,20 @@ class TestScaffolder:
 
         # Record cassette if requested
         if record and component_script:
-            self._record_test(
-                test_dir=test_dir,
-                source_data_dir=source_data_dir,
-                expected_out_dir=expected_out_dir,
-                component_script=component_script,
-                config=config,
-                freeze_time_at=freeze_time_at,
-                secrets_override=secrets_override,
-            )
+            cassette_path = source_data_dir / "cassettes" / VCRRecorder.DEFAULT_CASSETTE_FILE
+            if add_missing and not regenerate and cassette_path.exists():
+                logger.info(f"Skipping {test_name} — cassette exists (use --regenerate to force)")
+            else:
+                self._record_test(
+                    test_dir=test_dir,
+                    source_data_dir=source_data_dir,
+                    expected_out_dir=expected_out_dir,
+                    component_script=component_script,
+                    config=config,
+                    freeze_time_at=freeze_time_at,
+                    secrets_override=secrets_override,
+                    regenerate=regenerate,
+                )
 
         return test_dir
 
@@ -261,6 +287,7 @@ class TestScaffolder:
         config: dict[str, Any],
         freeze_time_at: str | None,
         secrets_override: dict[str, Any] | None = None,
+        regenerate: bool = False,
     ) -> None:
         """Run component and record cassette.
 
@@ -269,9 +296,6 @@ class TestScaffolder:
         recording finishes the on-disk ``config.json`` is restored to the
         original dummy values so that real credentials are never committed.
         """
-        from .recorder import VCRRecorder
-        from .validator import save_output_snapshot
-
         # Build the config that will actually be used during recording.
         # If an external secrets override is provided, deep-merge it in.
         if secrets_override:
@@ -291,6 +315,9 @@ class TestScaffolder:
             freeze_time_at=freeze_time_at,
             secrets_override=secrets_override,
         )
+
+        if regenerate:
+            recorder.clear_cassette()
 
         # Run component with recording
         def run_component():
