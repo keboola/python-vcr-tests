@@ -12,6 +12,15 @@ Usage:
     from keboola.vcr.sanitizers import ConfigSecretsSanitizer
 """
 
+from .log_capture import (
+    CapturedLog,
+    ComponentRunResult,
+    LogComparisonResult,
+    compare_logs,
+    load_logs,
+    run_with_log_capture,
+    save_logs,
+)
 from .recorder import (
     CassetteMissingError,
     JsonIndentedSerializer,
@@ -50,6 +59,14 @@ from .validator import (
 )
 
 __all__ = [
+    # Log capture
+    "CapturedLog",
+    "ComponentRunResult",
+    "LogComparisonResult",
+    "compare_logs",
+    "load_logs",
+    "run_with_log_capture",
+    "save_logs",
     # Recorder
     "VCRRecorder",
     "VCRRecorderError",

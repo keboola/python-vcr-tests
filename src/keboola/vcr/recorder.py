@@ -29,6 +29,15 @@ try:
 except ImportError:
     freeze_time = None  # type: ignore
 
+from .log_capture import (
+    ComponentRunResult,
+    LogComparisonResult,
+    LogSanitizer,
+    compare_logs,
+    load_logs,
+    run_with_log_capture,
+    save_logs,
+)
 from .sanitizers import BaseSanitizer, CompositeSanitizer, DefaultSanitizer, create_default_sanitizer, extract_values
 
 logger = logging.getLogger(__name__)
@@ -84,6 +93,9 @@ class VCRRecorder:
         match_on: list[str] | None = None,
         cassette_file: str = DEFAULT_CASSETTE_FILE,
         decode_compressed_response: bool = True,
+        capture_logs: bool = True,
+        log_normalizers: list[tuple[str, str]] | None = None,
+        ignored_loggers: set[str] | None = None,
     ):
         """
         Initialize VCR recorder.
@@ -103,6 +115,11 @@ class VCRRecorder:
                 readable text and avoids replay failures with libraries that parse raw
                 response bodies (e.g. Zeep/SOAP WSDL parsing). Disable for APIs that
                 return intentionally compressed binary payloads.
+            capture_logs: Whether to capture component logs and exit code (default: True)
+            log_normalizers: Regex replacement pairs applied to messages before comparison.
+                            Defaults to DEFAULT_NORMALIZERS (UUID, epoch normalization).
+            ignored_loggers: Logger name prefixes to exclude from capture.
+                            Defaults to DEFAULT_IGNORED_LOGGERS (vcr, urllib3, etc.).
         """
         self._check_dependencies()
 
@@ -114,6 +131,12 @@ class VCRRecorder:
         self.freeze_time_at = freeze_time_at
         self.record_mode = record_mode
         self.match_on = match_on or ["method", "scheme", "host", "port", "path", "query"]
+        self.capture_logs = capture_logs
+        self.log_normalizers = log_normalizers
+        self.ignored_loggers = ignored_loggers
+        self.logs_path = self.cassette_dir / "logs.json"
+        self.last_run_result: ComponentRunResult | None = None
+        self.last_log_comparison: LogComparisonResult | None = None
 
         # Set up sanitizers
         if sanitizers is not None:
@@ -314,9 +337,9 @@ class VCRRecorder:
 
                 if self.freeze_time_at and self.freeze_time_at != "auto":
                     with freeze_time(self.freeze_time_at):
-                        component_runner()
+                        self._execute_and_record_logs(component_runner)
                 else:
-                    component_runner()
+                    self._execute_and_record_logs(component_runner)
         finally:
             _VCRHTTPResponse.__init__ = _original_vcr_init
 
@@ -365,14 +388,36 @@ class VCRRecorder:
             if effective_freeze_time:
                 with freeze_time(effective_freeze_time):
                     with vcr_context:
-                        component_runner()
+                        self._execute_and_replay_logs(component_runner)
             else:
                 with vcr_context:
-                    component_runner()
+                    self._execute_and_replay_logs(component_runner)
         finally:
             self._is_replaying = False
 
         logger.info("Replay completed successfully")
+
+    def _execute_and_record_logs(self, component_runner: Callable) -> None:
+        """Run component during recording, capturing logs and exit code if enabled."""
+        if self.capture_logs:
+            result = run_with_log_capture(component_runner, self.ignored_loggers)
+            if self.secrets:
+                result = LogSanitizer(self.secrets).sanitize(result)
+            self.last_run_result = result
+            save_logs(result, self.logs_path)
+        else:
+            component_runner()
+
+    def _execute_and_replay_logs(self, component_runner: Callable) -> None:
+        """Run component during replay, capturing logs and comparing against recorded logs."""
+        if self.capture_logs:
+            result = run_with_log_capture(component_runner, self.ignored_loggers)
+            self.last_run_result = result
+            if self.logs_path.exists():
+                recorded = load_logs(self.logs_path)
+                self.last_log_comparison = compare_logs(recorded, result, self.log_normalizers)
+        else:
+            component_runner()
 
     def has_cassette(self) -> bool:
         """Check if cassette exists for replay."""
