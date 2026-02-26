@@ -184,6 +184,7 @@ class TestScaffolder:
                 secrets_override=secrets_override,
                 input_state=chained_state,
                 regenerate=regenerate,
+                input_files_dir=Path(input_files_dir) if input_files_dir is not None else None,
             )
             created_paths.append(test_path)
 
@@ -193,9 +194,6 @@ class TestScaffolder:
                     with open(state_path, "r") as f:
                         chained_state = json.load(f)
                     logger.info(f"Chained state from {test_path.name} for next test")
-
-        if input_files_dir is not None:
-            self._copy_input_files(created_paths, Path(input_files_dir))
 
         return created_paths
 
@@ -249,6 +247,7 @@ class TestScaffolder:
         secrets_override: dict[str, Any] | None = None,
         input_state: dict[str, Any] | None = None,
         regenerate: bool = False,
+        input_files_dir: Path | None = None,
     ) -> Path:
         """Create folder structure for a single test."""
         # Validate definition
@@ -291,6 +290,10 @@ class TestScaffolder:
             json.dump(input_state_data, f, indent=2)
 
         logger.info(f"Created test folder structure: {test_dir}")
+
+        # Copy input files before running the component so the writer can find them
+        if input_files_dir is not None:
+            self._copy_input_files([test_dir], input_files_dir)
 
         # Record cassette if requested
         if record and component_script:
