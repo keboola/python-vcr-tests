@@ -15,6 +15,37 @@ Supports two input formats:
    falls back to a numbered index).  An optional *secrets file* can be
    provided to deep-merge real credentials at recording time while
    keeping only dummy values in the committed ``config.json``.
+
+## Standard repo layout (used by the CLI defaults)
+
+``tests/setup/`` is the conventional home for scaffold inputs:
+
+- ``tests/setup/configs.json``     — test definitions (wrapped or raw format)
+- ``tests/setup/input_files/``     — CSV/files for writer components
+
+When ``input_files_dir`` is provided (default: ``tests/setup/input_files``),
+the scaffolder reads each test's ``config.json`` after folder creation and
+copies matching files into the test's ``in/tables/`` or ``in/files/`` based
+on the ``storage.input.tables[].destination`` / ``storage.input.files[].destination``
+entries.  This is the mechanism used to supply writer components with their
+input data during recording without bundling large CSVs in the test tree.
+
+Example ``configs.json`` entry for a writer::
+
+    {
+      "name": "01_write_data",
+      "config": {
+        "parameters": {"#api_key": "DUMMY"},
+        "storage": {
+          "input": {
+            "tables": [{"destination": "my_input_table.csv"}]
+          }
+        }
+      }
+    }
+
+Place ``tests/setup/input_files/my_input_table.csv`` and run scaffold — the
+file is copied into each test's ``source/data/in/tables/`` automatically.
 """
 
 from __future__ import annotations
@@ -72,6 +103,7 @@ class TestScaffolder:
         secrets_file: Path | None = None,
         chain_state: bool = False,
         regenerate: bool = False,
+        input_files_dir: Path | None = None,
     ) -> list[Path]:
         """
         Create test folders from definitions file.
@@ -90,6 +122,12 @@ class TestScaffolder:
             regenerate: Delete existing cassettes before recording so fresh
                 interactions are captured from the live API.  When False,
                 tests that already have a cassette are skipped.
+            input_files_dir: Optional directory containing CSV/files for writer
+                components.  After scaffolding each test folder the contents are
+                copied into ``in/tables/`` or ``in/files/`` based on the
+                ``storage.input`` mappings in each test's ``config.json``.
+                Defaults to ``tests/setup/input_files`` when called via the CLI.
+                If the directory does not exist it is silently skipped.
 
         Returns:
             List of created test folder paths
@@ -146,6 +184,7 @@ class TestScaffolder:
                 secrets_override=secrets_override,
                 input_state=chained_state,
                 regenerate=regenerate,
+                input_files_dir=Path(input_files_dir) if input_files_dir is not None else None,
             )
             created_paths.append(test_path)
 
@@ -208,6 +247,7 @@ class TestScaffolder:
         secrets_override: dict[str, Any] | None = None,
         input_state: dict[str, Any] | None = None,
         regenerate: bool = False,
+        input_files_dir: Path | None = None,
     ) -> Path:
         """Create folder structure for a single test."""
         # Validate definition
@@ -250,6 +290,10 @@ class TestScaffolder:
             json.dump(input_state_data, f, indent=2)
 
         logger.info(f"Created test folder structure: {test_dir}")
+
+        # Copy input files before running the component so the writer can find them
+        if input_files_dir is not None:
+            self._copy_input_files([test_dir], input_files_dir)
 
         # Record cassette if requested
         if record and component_script:
@@ -372,6 +416,55 @@ class TestScaffolder:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _copy_input_files(created_paths: list[Path], input_files_dir: Path) -> None:
+        """Copy input CSV/files into scaffolded test dirs from a shared input_files directory.
+
+        Reads each test's ``config.json`` and copies files listed under
+        ``storage.input.tables[].destination`` into ``in/tables/`` and
+        ``storage.input.files[].destination`` into ``in/files/``.
+
+        Silently skips if *input_files_dir* does not exist or a referenced
+        source file is missing — the user will get a clear runtime error from
+        the component if a required input is absent.
+        """
+        if not input_files_dir.exists():
+            return
+
+        for test_dir in created_paths:
+            config_path = test_dir / "source" / "data" / "config.json"
+            if not config_path.exists():
+                continue
+
+            try:
+                config = json.loads(config_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            storage = config.get("storage", {})
+
+            for entry in storage.get("input", {}).get("tables", []):
+                dest = entry.get("destination", "")
+                if not dest:
+                    continue
+                src = input_files_dir / dest
+                if src.exists():
+                    target_dir = test_dir / "source" / "data" / "in" / "tables"
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, target_dir / dest)
+                    logger.info(f"Copied {src} -> {target_dir / dest}")
+
+            for entry in storage.get("input", {}).get("files", []):
+                dest = entry.get("destination", "")
+                if not dest:
+                    continue
+                src = input_files_dir / dest
+                if src.exists():
+                    target_dir = test_dir / "source" / "data" / "in" / "files"
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, target_dir / dest)
+                    logger.info(f"Copied {src} -> {target_dir / dest}")
 
     def _mask_secrets(
         self,

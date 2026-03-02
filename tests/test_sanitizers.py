@@ -474,11 +474,12 @@ class TestConfigSecretsSanitizer:
 
 class TestCreateDefaultSanitizer:
     def test_creates_default_sanitizer_with_secret_values(self):
-        secrets = {"api_key": "my-key", "password": "s3cret"}
+        secrets = {"#api_key": "my-key", "#password": "s3cret", "oauthVersion": "2.0"}
         s = create_default_sanitizer(secrets)
         assert isinstance(s, DefaultSanitizer)
         assert "my-key" in s.sensitive_values
         assert "s3cret" in s.sensitive_values
+        assert "2.0" not in s.sensitive_values
 
     def test_empty_secrets(self):
         s = create_default_sanitizer({})

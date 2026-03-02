@@ -174,7 +174,7 @@ class TestVCRRecorderInit:
     def test_no_sanitizers_uses_create_default_sanitizer(self, tmp_cassette_dir):
         with patch("keboola.vcr.recorder.vcr") as mock_vcr:
             mock_vcr.VCR.return_value = MagicMock()
-            r = VCRRecorder(cassette_dir=tmp_cassette_dir, secrets={"k": "v"})
+            r = VCRRecorder(cassette_dir=tmp_cassette_dir, secrets={"#k": "v"})
         assert isinstance(r.sanitizer, DefaultSanitizer)
         assert "v" in r.sanitizer.sensitive_values
 

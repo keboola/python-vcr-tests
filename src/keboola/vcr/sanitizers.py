@@ -789,9 +789,12 @@ def create_default_sanitizer(secrets: dict[str, Any]) -> DefaultSanitizer:
     """
     Create a default sanitizer from secrets.
 
-    Extracts all string values from the secrets dict and returns a
-    DefaultSanitizer that handles OAuth bodies, JSON responses, headers,
-    and URL parameters automatically.
+    Collects only values under #-prefixed keys (Keboola's encrypted-field
+    convention) and returns a DefaultSanitizer that handles OAuth bodies,
+    JSON responses, headers, and URL parameters automatically.
+
+    Non-sensitive metadata fields (oauthVersion, id, created, etc.) are
+    intentionally skipped to avoid corrupting URL paths in cassettes.
 
     Args:
         secrets: Dictionary of secret values to redact
@@ -799,7 +802,8 @@ def create_default_sanitizer(secrets: dict[str, Any]) -> DefaultSanitizer:
     Returns:
         A DefaultSanitizer with extracted secret values
     """
-    secret_values = extract_values(secrets, [])
+    secret_values: list[str] = []
+    _collect_hash_values(secrets, secret_values)
     return DefaultSanitizer(sensitive_values=secret_values)
 
 
