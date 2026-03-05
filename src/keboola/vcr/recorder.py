@@ -474,13 +474,7 @@ class VCRRecorder:
             return
 
         with open(temp_path, "a") as f:
-            json.dump(
-                {"request": filtered_request._to_dict(), "response": filtered_response},
-                f,
-                cls=_BytesEncoder,
-                sort_keys=True,
-            )
-            f.write("\n")
+            _write_interaction_chunked(f, filtered_request._to_dict(), filtered_response)
 
         # Periodically release freed pages back to OS to prevent RSS growth
         # from memory fragmentation across long-running recordings.
@@ -762,6 +756,58 @@ class _VCRRecordingReader:
         assembled ``response._content``.
         """
         return memoryview(self._data)
+
+
+def _write_json_string_chunked(f, s: str, chunk_size: int = 65536) -> None:
+    """Write a JSON-encoded string to f in 64 KB chunks.
+
+    json.dumps(large_string) allocates the entire escaped form at once, which
+    for multi-MB bodies creates a transient allocation large enough to fragment
+    glibc's heap.  Chunking keeps each escaped piece ≤ ~130 KB so it falls
+    just above glibc's mmap threshold and the allocator returns it to the OS
+    immediately on free rather than leaving it stranded on the heap.
+    """
+    f.write('"')
+    for i in range(0, len(s), chunk_size):
+        f.write(json.dumps(s[i : i + chunk_size])[1:-1])  # strip enclosing quotes
+    f.write('"')
+
+
+def _write_interaction_chunked(f, req_dict: dict, response: dict) -> None:
+    """Serialize a VCR interaction to f as a JSONL record.
+
+    The response body string is written in 64 KB chunks (see _write_json_string_chunked)
+    to prevent large transient allocations from fragmenting glibc's heap.
+    All other fields are small and serialized normally.
+    """
+    body_dict = response.get("body", {})
+    resp_rest = {k: v for k, v in response.items() if k != "body"}
+
+    f.write('{"request": ')
+    json.dump(req_dict, f, cls=_BytesEncoder, sort_keys=True)
+    f.write(', "response": {"body": ')
+    if "string" in body_dict:
+        body_string = body_dict["string"]
+        if isinstance(body_string, bytes):
+            try:
+                body_str = body_string.decode("utf-8")
+            except UnicodeDecodeError:
+                body_str = base64.b64encode(body_string).decode("ascii")
+        else:
+            body_str = body_string if body_string is not None else ""
+        body_rest = {k: v for k, v in body_dict.items() if k != "string"}
+        f.write('{"string": ')
+        _write_json_string_chunked(f, body_str)
+        if body_rest:
+            f.write(", ")
+            f.write(json.dumps(body_rest, cls=_BytesEncoder, sort_keys=True)[1:-1])
+        f.write("}")
+    else:
+        json.dump(body_dict, f, cls=_BytesEncoder, sort_keys=True)
+    if resp_rest:
+        f.write(", ")
+        f.write(json.dumps(resp_rest, cls=_BytesEncoder, sort_keys=True)[1:-1])
+    f.write("}}\n")
 
 
 def _trim_process_memory() -> None:
