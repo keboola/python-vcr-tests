@@ -908,9 +908,8 @@ def _pool_reuse_patch():
             # it ourselves so that certificate verification works correctly.
             ctx.load_default_certs()
             pool.conn_kw["ssl_context"] = ctx
-            logger.warning("[vcr-pool-fix] injected shared ssl_context into pool for %s", pool.host)
         except Exception as exc:
-            logger.warning("[vcr-pool-fix] could not inject ssl_context: %s", exc)
+            logger.warning("VCR: could not inject shared ssl_context into pool for %s: %s", pool.host, exc)
 
     def _reusing_cfh(self, host, port=None, scheme="http", pool_kwargs=None, **kw):
         key = (scheme, host, port)
@@ -921,19 +920,16 @@ def _pool_reuse_patch():
         return _shared_pools[key]
 
     PoolManager.connection_from_host = _reusing_cfh
-    logger.warning("[vcr-pool-fix] pool reuse patch active")
     try:
         yield
     finally:
         PoolManager.connection_from_host = _original_cfh
-        n_pools = len(_shared_pools)
         for pool in _shared_pools.values():
             try:
                 pool.close()
             except Exception:
                 pass
         _shared_pools.clear()
-        logger.warning(f"[vcr-pool-fix] pool reuse patch removed — had {n_pools} shared pool(s)")
 
 
 def _zero_copy_vcr_response_init(self_resp, recorded_response, *, original_init) -> None:
