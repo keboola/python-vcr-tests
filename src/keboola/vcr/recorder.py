@@ -1087,10 +1087,21 @@ def _pool_reuse_patch():
     by gc.collect(), and adds ~8 MB per 10 interactions — causing OOM for
     Facebook Ads jobs with 500–2000 interactions.
 
-    Fix: intercept PoolManager.connection_from_host at the class level and
-    return the first pool for any given (scheme, host, port) instead of letting
-    each new PoolManager create its own.  Safe during recording — all pools
-    target the same host, so reuse is the correct and efficient behaviour.
+    Fix 1 (pool reuse): intercept PoolManager.connection_from_host at the class
+    level and return the first pool for any given (scheme, host, port) instead of
+    letting each new PoolManager create its own.
+
+    Fix 2 (ssl_context reuse): inject a single shared ssl.SSLContext into each
+    pool's conn_kw so that ALL connections created by _new_conn() for that pool
+    share the same SSLContext.  Without this, each _new_conn() + _validate_conn()
+    sequence calls real_connection.connect() → _ssl_wrap_socket_and_match_hostname
+    with ssl_context=None → create_urllib3_context() + load_default_certs() for
+    EVERY interaction.  load_default_certs() loads ~480 KB of CA cert data into
+    OpenSSL's C-heap; jemalloc never returns this to the OS even after the
+    SSLContext is freed, so RSS grows ~480 KB per interaction.
+
+    With a shared SSLContext, load_default_certs() runs once per host and all
+    subsequent connect() calls reuse the already-loaded context.
 
     IMPORTANT: must be applied INSIDE the vcrpy cassette context so that pools
     created (and cached) here already carry vcrpy's patched connection stubs.
@@ -1104,10 +1115,35 @@ def _pool_reuse_patch():
     _shared_pools: dict = {}
     _original_cfh = PoolManager.connection_from_host
 
+    def _inject_shared_ssl_context(pool, scheme: str) -> None:
+        """Inject a single shared SSLContext into the pool's conn_kw.
+
+        This ensures all connections created by pool._new_conn() reuse one
+        SSLContext instead of creating a new one (and calling load_default_certs)
+        on every connect().
+        """
+        if scheme != "https":
+            return
+        if pool.conn_kw.get("ssl_context") is not None:
+            return
+        try:
+            from urllib3.util.ssl_ import create_urllib3_context
+            ctx = create_urllib3_context()
+            # load_default_certs() is only called by urllib3 when it creates its own
+            # context (default_ssl_context=True).  Since we supply one, we must call
+            # it ourselves so that certificate verification works correctly.
+            ctx.load_default_certs()
+            pool.conn_kw["ssl_context"] = ctx
+            logger.warning("[vcr-pool-fix] injected shared ssl_context into pool for %s", pool.host)
+        except Exception as exc:
+            logger.warning("[vcr-pool-fix] could not inject ssl_context: %s", exc)
+
     def _reusing_cfh(self, host, port=None, scheme="http", pool_kwargs=None, **kw):
         key = (scheme, host, port)
         if key not in _shared_pools:
-            _shared_pools[key] = _original_cfh(self, host, port=port, scheme=scheme, pool_kwargs=pool_kwargs, **kw)
+            pool = _original_cfh(self, host, port=port, scheme=scheme, pool_kwargs=pool_kwargs, **kw)
+            _inject_shared_ssl_context(pool, scheme)
+            _shared_pools[key] = pool
         return _shared_pools[key]
 
     PoolManager.connection_from_host = _reusing_cfh
