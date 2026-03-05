@@ -347,6 +347,8 @@ class VCRRecorder:
                 )
                 # Suppress the context-exit _save() — we write directly to temp_path
                 cassette._save = lambda force=False: None
+                # Store cassette reference for diagnostic logging in _append_interaction
+                self._diag_cassette = cassette
 
                 if self.freeze_time_at and self.freeze_time_at != "auto":
                     with freeze_time(self.freeze_time_at):
@@ -484,9 +486,8 @@ class VCRRecorder:
             )
 
         # Short tracemalloc window: capture allocations for exactly 10 interactions
-        # starting at interaction 91 (arbitrary mid-run point) to identify what
-        # is being allocated and RETAINED per interaction without the overhead of
-        # tracing the entire recording.
+        # starting at interaction 91 to identify what is allocated and RETAINED
+        # per interaction without the overhead of tracing the whole recording.
         if self._interaction_count == 91:
             import tracemalloc
             tracemalloc.start(3)  # 3 stack frames
@@ -498,6 +499,41 @@ class VCRRecorder:
             top = snapshot.statistics("lineno")[:15]
             for stat in top:
                 logger.warning(f"[vcr-mem] tmalloc: {stat}")
+
+        # GC object scan every 50 interactions: count by type and find large bytes.
+        # Identifies which Python type is accumulating and whether response bodies
+        # (bytes > 10 KB) are the source.
+        if self._interaction_count % 50 == 0:
+            import gc
+            gc.collect()
+            type_counts: dict[str, int] = {}
+            large_bytes_count = 0
+            large_bytes_total = 0
+            for obj in gc.get_objects():
+                t = type(obj).__qualname__
+                type_counts[t] = type_counts.get(t, 0) + 1
+                if isinstance(obj, (bytes, bytearray)) and len(obj) > 10_000:
+                    large_bytes_count += 1
+                    large_bytes_total += len(obj)
+            top_types = sorted(type_counts.items(), key=lambda x: -x[1])[:10]
+            logger.warning(
+                f"[vcr-gc] n={self._interaction_count} "
+                f"gc_objects={sum(type_counts.values())} "
+                f"top_types={top_types}"
+            )
+            logger.warning(
+                f"[vcr-gc] n={self._interaction_count} "
+                f"large_bytes_count={large_bytes_count} "
+                f"large_bytes_total={large_bytes_total // 1024}KB"
+            )
+            cassette = getattr(self, "_diag_cassette", None)
+            if cassette is not None:
+                logger.warning(
+                    f"[vcr-gc] n={self._interaction_count} "
+                    f"cassette.data={len(cassette.data)} "
+                    f"cassette._old_interactions={len(getattr(cassette, '_old_interactions', []))} "
+                    f"cassette.responses={len(getattr(cassette, 'responses', {}))}"
+                )
 
     def _resolve_freeze_time(self) -> str | None:
         """Resolve effective freeze_time, reading from metadata if 'auto'."""
