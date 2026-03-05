@@ -34,6 +34,7 @@ from .sanitizers import (
     CompositeSanitizer,
     DefaultSanitizer,
     _dedup_sanitizers,
+    _sanitize_counters,
     create_default_sanitizer,
     extract_values,
 )
@@ -41,6 +42,18 @@ from .sanitizers import (
 logger = logging.getLogger(__name__)
 
 _TRIM_INTERVAL = 50  # call malloc_trim every N recorded interactions
+
+
+def _get_rss_mb() -> float:
+    """Read process RSS from /proc/self/status (Linux). Returns 0.0 elsewhere."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
 
 
 class VCRRecorderError(Exception):
@@ -134,6 +147,10 @@ class VCRRecorder:
         # contain sanitized data from when they were recorded.  Only request
         # sanitization runs during replay (needed for matching).
         self._is_replaying = False
+
+        # Profiling counters (always-on during recording, zero cost during replay)
+        self._prof_skip_count = 0
+        self._prof_parse_count = 0
 
         # Configure VCR
         self._vcr = self._create_vcr_instance()
@@ -241,7 +258,24 @@ class VCRRecorder:
             freeze_time_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             cassette_file=f"vcr_debug_{component_id}_{config_id}_{timestamp}.json",
         )
+
+        import tracemalloc
+
+        tracemalloc.start()
+        rss_before = _get_rss_mb()
+        logger.warning(f"[vcr-mem] debug recording start rss={rss_before:.1f}MB")
+
         recorder.record(component_runner)
+
+        snapshot = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+        rss_after = _get_rss_mb()
+        logger.warning(
+            f"[vcr-mem] debug recording end rss={rss_after:.1f}MB (delta={rss_after - rss_before:.1f}MB)"
+        )
+        top_stats = snapshot.statistics("lineno")
+        for stat in top_stats[:20]:
+            logger.warning(f"[vcr-mem] tracemalloc: {stat}")
 
     def run(
         self,
@@ -329,6 +363,11 @@ class VCRRecorder:
                     component_runner()
         finally:
             _VCRHTTPResponse.__init__ = _original_vcr_init
+
+        logger.warning(
+            f"[vcr-mem] recording complete: cassette.data len={len(cassette.data)} "
+            f"(should be 0 if append patch worked)"
+        )
 
         metadata = {
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -448,6 +487,15 @@ class VCRRecorder:
         self._interaction_count = getattr(self, "_interaction_count", 0) + 1
         if self._interaction_count % _TRIM_INTERVAL == 0:
             _trim_process_memory()
+
+        # Log RSS + sanitizer counters every 10 interactions for OOM diagnosis
+        if self._interaction_count % 10 == 0:
+            rss = _get_rss_mb()
+            logger.warning(
+                f"[vcr-mem] interaction={self._interaction_count} "
+                f"rss={rss:.1f}MB "
+                f"skip={_sanitize_counters['skip']} parse={_sanitize_counters['parse']}"
+            )
 
     def _resolve_freeze_time(self) -> str | None:
         """Resolve effective freeze_time, reading from metadata if 'auto'."""

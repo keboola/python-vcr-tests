@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any
 
 
+# Module-level counters for profiling _sanitize_body behaviour.
+# Incremented by DefaultSanitizer._sanitize_body and read by VCRRecorder._append_interaction.
+_sanitize_counters: dict[str, int] = {"skip": 0, "parse": 0}
+
+
 class BaseSanitizer(ABC):
     """
     Base class for request/response sanitization.
@@ -152,6 +157,7 @@ class DefaultSanitizer(BaseSanitizer):
             value in body for value in self.sensitive_values
         )
         if not needs_json_sanitization:
+            _sanitize_counters["skip"] += 1
             # Still apply form-encoded / exact value checks (cheap string ops)
             result = body
             for pattern in self._field_patterns:
@@ -161,6 +167,7 @@ class DefaultSanitizer(BaseSanitizer):
                     result = result.replace(value, self.replacement)
             return result
 
+        _sanitize_counters["parse"] += 1
         # 1. Try JSON (only when pre-scan found a potential sensitive field/value)
         try:
             data = json.loads(body)
