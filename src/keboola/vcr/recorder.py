@@ -74,17 +74,38 @@ try:
         pass
     # --- end urllib3 connection-reuse fix ---
 
-    # --- VCRHTTPResponse missing lifecycle methods fix ---
-    # urllib3 and requests call release_conn() / drain_conn() on response.raw after
-    # consuming a response to return the connection to the pool.  VCRHTTPResponse
-    # only has drain_conn() (added in vcrpy 6.x) but is missing release_conn().
-    # Without it, AttributeError is silently swallowed by urllib3's PoolManager and
-    # the connection slot is never returned — objects accumulate in the pool and RSS
-    # grows steadily.  Adding no-ops here is safe: VCR connections are not real sockets
-    # so there is nothing to actually release.
+    # --- VCRHTTPResponse.release_conn fix ---
+    # urllib3 2.x returns VCRHTTPResponse *directly* from _make_request() (it is
+    # duck-typed as BaseHTTPResponse).  urllib3 then stamps
+    #   response._connection = VCRHTTPConnection
+    #   response._pool       = HTTPConnectionPool
+    # on the VCRHTTPResponse instance and returns it straight to requests as
+    # response.raw.  When requests finishes reading the body it calls
+    #   response.raw.release_conn()
+    # which hits VCRHTTPResponse — NOT urllib3.response.HTTPResponse — so urllib3's
+    # own release_conn() machinery is bypassed entirely.
+    #
+    # Without a working release_conn(), _put_conn() is never called, the pool queue
+    # stays empty (q=0), and _new_conn() fires for every request.  Each _new_conn()
+    # creates a new VCRHTTPConnection + real urllib3 HTTPSConnection + SSLContext
+    # (~480 KB of OpenSSL C-heap loaded from the system CA store).  That adds up to
+    # ~8 MB per 10 interactions and causes OOM for jobs with 500+ interactions.
+    #
+    # The fix: implement release_conn() to return _connection to the pool, exactly
+    # mirroring what urllib3.response.HTTPResponse.release_conn() does.  This is safe
+    # because VCRHTTPConnection is just a stub — _put_conn() merely places it back in
+    # the pool queue so it can be reused on the next request, where vcrpy replaces the
+    # socket with a VCRFakeSocket / real_connection reconnect as usual.
     if not hasattr(_VCRHTTPResponse, "release_conn"):
-        _VCRHTTPResponse.release_conn = lambda self: None  # type: ignore[attr-defined]
-    # --- end VCRHTTPResponse missing lifecycle methods fix ---
+        def _vcr_release_conn(self) -> None:  # noqa: E306
+            pool = getattr(self, "_pool", None)
+            conn = getattr(self, "_connection", None)
+            if pool is not None and conn is not None:
+                pool._put_conn(conn)
+                self._connection = None
+
+        _VCRHTTPResponse.release_conn = _vcr_release_conn  # type: ignore[attr-defined]
+    # --- end VCRHTTPResponse.release_conn fix ---
 
 except ImportError:
     vcr = None  # type: ignore
