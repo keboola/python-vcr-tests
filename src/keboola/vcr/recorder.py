@@ -9,6 +9,7 @@ for deterministic testing.
 from __future__ import annotations
 
 import base64
+import contextlib
 import functools
 import json
 import logging
@@ -415,11 +416,12 @@ class VCRRecorder:
                 # Store cassette reference for diagnostic logging in _append_interaction
                 self._diag_cassette = cassette
 
-                if self.freeze_time_at and self.freeze_time_at != "auto":
-                    with freeze_time(self.freeze_time_at):
+                with _pool_reuse_patch():
+                    if self.freeze_time_at and self.freeze_time_at != "auto":
+                        with freeze_time(self.freeze_time_at):
+                            component_runner()
+                    else:
                         component_runner()
-                else:
-                    component_runner()
         finally:
             _VCRHTTPResponse.__init__ = _original_vcr_init
 
@@ -1048,6 +1050,59 @@ def _write_interaction_chunked(f, req_dict: dict, response: dict) -> None:
         f.write(", ")
         f.write(json.dumps(resp_rest, cls=_BytesEncoder, sort_keys=True)[1:-1])
     f.write("}}\n")
+
+
+@contextlib.contextmanager
+def _pool_reuse_patch():
+    """Prevent urllib3 connection pool proliferation during VCR recording.
+
+    When the component creates a new requests.Session per API query (common with
+    Facebook Graph API batch requests), each session creates its own
+    urllib3.PoolManager which creates a fresh HTTPSConnectionPool for
+    graph.facebook.com:443.  For N interactions this results in N pools, each
+    with its own SSLContext (~480 KB of C-heap loaded from the system CA store).
+
+    This C-heap growth does NOT appear in Python tracemalloc, is NOT collected
+    by gc.collect(), and adds ~8 MB per 10 interactions — causing OOM for
+    Facebook Ads jobs with 500–2000 interactions.
+
+    Fix: intercept PoolManager.connection_from_host at the class level and
+    return the first pool for any given (scheme, host, port) instead of letting
+    each new PoolManager create its own.  Safe during recording — all pools
+    target the same host, so reuse is the correct and efficient behaviour.
+
+    IMPORTANT: must be applied INSIDE the vcrpy cassette context so that pools
+    created (and cached) here already carry vcrpy's patched connection stubs.
+    """
+    try:
+        from urllib3.poolmanager import PoolManager
+    except ImportError:
+        yield
+        return
+
+    _shared_pools: dict = {}
+    _original_cfh = PoolManager.connection_from_host
+
+    def _reusing_cfh(self, host, port=None, scheme="http", pool_kwargs=None, **kw):
+        key = (scheme, host, port)
+        if key not in _shared_pools:
+            _shared_pools[key] = _original_cfh(self, host, port=port, scheme=scheme, pool_kwargs=pool_kwargs, **kw)
+        return _shared_pools[key]
+
+    PoolManager.connection_from_host = _reusing_cfh
+    logger.warning("[vcr-pool-fix] pool reuse patch active")
+    try:
+        yield
+    finally:
+        PoolManager.connection_from_host = _original_cfh
+        n_pools = len(_shared_pools)
+        for pool in _shared_pools.values():
+            try:
+                pool.close()
+            except Exception:
+                pass
+        _shared_pools.clear()
+        logger.warning(f"[vcr-pool-fix] pool reuse patch removed — had {n_pools} shared pool(s)")
 
 
 def _get_smaps_rollup() -> dict[str, int]:
