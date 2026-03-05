@@ -20,6 +20,48 @@ from typing import Any, Callable
 try:
     import vcr
     from vcr.stubs import VCRHTTPResponse as _VCRHTTPResponse
+
+    # --- urllib3 connection-reuse fix ---
+    # urllib3's pool calls is_connection_dropped(conn) → not conn.is_connected before
+    # reusing a connection.  VCRConnection doesn't define is_connected, so __getattr__
+    # delegates to real_connection.is_connected, which checks real_connection.sock.
+    # During VCR recording, Facebook's API responds with Connection: close, which closes
+    # real_connection.sock.  urllib3 then sees is_connected=False and creates a NEW
+    # VCRHTTPConnection + real_connection + ssl_context per interaction.  The old
+    # objects are not GC'd immediately (GC runs every 50 interactions), so with ~1.6
+    # Connection-close interactions per request, ~80 dead ssl_contexts accumulate between
+    # GC runs — each holding OpenSSL C-level state (~100 KB) → ~8 MB/50 interactions.
+    # Patching is_connected to return True when a VCRFakeSocket is present tells urllib3
+    # the connection is alive so it reuses the existing VCRHTTPConnection + ssl_context.
+    # Real reconnection still happens via real_connection.connect(), but uses the same
+    # ssl_context (enabling TLS session resumption and capping live ssl_contexts at the
+    # pool maxsize of 10 rather than letting them accumulate unboundedly).
+    try:
+        from vcr.stubs import VCRFakeSocket as _VCRFakeSocket
+
+        _VCRConnection = _VCRHTTPResponse  # sentinel — replaced below
+
+        # Walk to VCRConnection (shared base of VCRHTTPConnection / VCRHTTPSConnection)
+        from vcr.stubs import VCRHTTPConnection as _VCRHTTPConnection
+
+        _VCRConnection = _VCRHTTPConnection.__bases__[0]
+
+        @property  # type: ignore[misc]
+        def _vcr_is_connected(self) -> bool:
+            sock = getattr(self, "_sock", None)
+            if isinstance(sock, _VCRFakeSocket):
+                return True  # fake socket → we're in VCR mode, report as connected
+            rc = getattr(self, "real_connection", None)
+            if rc is not None:
+                return bool(getattr(rc, "is_connected", False))
+            return False
+
+        _VCRConnection.is_connected = _vcr_is_connected  # type: ignore[attr-defined]
+        del _vcr_is_connected, _VCRHTTPConnection, _VCRConnection, _VCRFakeSocket
+    except Exception:
+        pass
+    # --- end urllib3 connection-reuse fix ---
+
 except ImportError:
     vcr = None  # type: ignore
     _VCRHTTPResponse = None  # type: ignore
