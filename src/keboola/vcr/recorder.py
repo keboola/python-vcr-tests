@@ -259,23 +259,15 @@ class VCRRecorder:
             cassette_file=f"vcr_debug_{component_id}_{config_id}_{timestamp}.json",
         )
 
-        import tracemalloc
-
-        tracemalloc.start()
         rss_before = _get_rss_mb()
         logger.warning(f"[vcr-mem] debug recording start rss={rss_before:.1f}MB")
 
         recorder.record(component_runner)
 
-        snapshot = tracemalloc.take_snapshot()
-        tracemalloc.stop()
         rss_after = _get_rss_mb()
         logger.warning(
             f"[vcr-mem] debug recording end rss={rss_after:.1f}MB (delta={rss_after - rss_before:.1f}MB)"
         )
-        top_stats = snapshot.statistics("lineno")
-        for stat in top_stats[:20]:
-            logger.warning(f"[vcr-mem] tracemalloc: {stat}")
 
     def run(
         self,
@@ -490,6 +482,22 @@ class VCRRecorder:
                 f"rss={rss:.1f}MB "
                 f"skip={_sanitize_counters['skip']} parse={_sanitize_counters['parse']}"
             )
+
+        # Short tracemalloc window: capture allocations for exactly 10 interactions
+        # starting at interaction 91 (arbitrary mid-run point) to identify what
+        # is being allocated and RETAINED per interaction without the overhead of
+        # tracing the entire recording.
+        if self._interaction_count == 91:
+            import tracemalloc
+            tracemalloc.start(3)  # 3 stack frames
+            logger.warning("[vcr-mem] tracemalloc window started (interactions 91-100)")
+        elif self._interaction_count == 100:
+            import tracemalloc
+            snapshot = tracemalloc.take_snapshot()
+            tracemalloc.stop()
+            top = snapshot.statistics("lineno")[:15]
+            for stat in top:
+                logger.warning(f"[vcr-mem] tmalloc: {stat}")
 
     def _resolve_freeze_time(self) -> str | None:
         """Resolve effective freeze_time, reading from metadata if 'auto'."""
