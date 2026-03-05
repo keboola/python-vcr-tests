@@ -121,26 +121,11 @@ from .sanitizers import (
     CompositeSanitizer,
     DefaultSanitizer,
     _dedup_sanitizers,
-    _sanitize_counters,
     create_default_sanitizer,
     extract_values,
 )
 
 logger = logging.getLogger(__name__)
-
-_TRIM_INTERVAL = 50  # call malloc_trim every N recorded interactions
-
-
-def _get_rss_mb() -> float:
-    """Read process RSS from /proc/self/status (Linux). Returns 0.0 elsewhere."""
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024
-    except Exception:
-        pass
-    return 0.0
 
 
 class VCRRecorderError(Exception):
@@ -346,15 +331,7 @@ class VCRRecorder:
             cassette_file=f"vcr_debug_{component_id}_{config_id}_{timestamp}.json",
         )
 
-        rss_before = _get_rss_mb()
-        logger.warning(f"[vcr-mem] debug recording start rss={rss_before:.1f}MB")
-
         recorder.record(component_runner)
-
-        rss_after = _get_rss_mb()
-        logger.warning(
-            f"[vcr-mem] debug recording end rss={rss_after:.1f}MB (delta={rss_after - rss_before:.1f}MB)"
-        )
 
     def run(
         self,
@@ -434,8 +411,6 @@ class VCRRecorder:
                 )
                 # Suppress the context-exit _save() — we write directly to temp_path
                 cassette._save = lambda force=False: None
-                # Store cassette reference for diagnostic logging in _append_interaction
-                self._diag_cassette = cassette
 
                 with _pool_reuse_patch():
                     if self.freeze_time_at and self.freeze_time_at != "auto":
@@ -445,11 +420,6 @@ class VCRRecorder:
                         component_runner()
         finally:
             _VCRHTTPResponse.__init__ = _original_vcr_init
-
-        logger.warning(
-            f"[vcr-mem] recording complete: cassette.data len={len(cassette.data)} "
-            f"(should be 0 if append patch worked)"
-        )
 
         metadata = {
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -557,202 +527,6 @@ class VCRRecorder:
 
         with open(temp_path, "a") as f:
             _write_interaction_chunked(f, filtered_request._to_dict(), filtered_response)
-
-        # Periodically release freed pages back to OS to prevent RSS growth
-        # from memory fragmentation across long-running recordings.
-        self._interaction_count = getattr(self, "_interaction_count", 0) + 1
-        if self._interaction_count % _TRIM_INTERVAL == 0:
-            _trim_process_memory()
-
-        # Log RSS + sanitizer counters every 10 interactions for OOM diagnosis
-        if self._interaction_count % 10 == 0:
-            rss = _get_rss_mb()
-            logger.warning(
-                f"[vcr-mem] interaction={self._interaction_count} "
-                f"rss={rss:.1f}MB "
-                f"skip={_sanitize_counters['skip']} parse={_sanitize_counters['parse']}"
-            )
-
-        # Start tracemalloc at interaction 1 if not already running (rolling snapshots)
-        try:
-            import tracemalloc as _tracemalloc
-            if not _tracemalloc.is_tracing():
-                _tracemalloc.start(5)
-        except Exception:
-            pass
-
-        # Comprehensive diagnostics every 50 interactions
-        if self._interaction_count % 50 == 0:
-            n = self._interaction_count
-
-            # a) smaps_rollup
-            try:
-                smaps = _get_smaps_rollup()
-                if smaps:
-                    logger.warning(
-                        f"[vcr-smaps] n={n} "
-                        f"rss={smaps.get('Rss', 0) / 1024:.1f}MB "
-                        f"private_dirty={smaps.get('Private_Dirty', 0) / 1024:.1f}MB "
-                        f"anon={smaps.get('Anonymous', 0) / 1024:.1f}MB "
-                        f"shared_clean={smaps.get('Shared_Clean', 0) / 1024:.1f}MB"
-                    )
-            except Exception:
-                pass
-
-            # b) mallinfo
-            try:
-                minfo = _get_mallinfo()
-                if minfo:
-                    logger.warning(
-                        f"[vcr-heap] n={n} "
-                        f"arena={minfo['arena'] / 1024 / 1024:.1f}MB "
-                        f"in_use={minfo['uordblks'] / 1024 / 1024:.1f}MB "
-                        f"free={minfo['fordblks'] / 1024 / 1024:.1f}MB "
-                        f"mmap_chunks={minfo['hblks']} "
-                        f"mmap_bytes={minfo['hblkhd'] / 1024 / 1024:.1f}MB"
-                    )
-            except Exception:
-                pass
-
-            # c) fd count
-            try:
-                fd_count = _get_fd_count()
-                logger.warning(f"[vcr-fd] n={n} open_fds={fd_count}")
-            except Exception:
-                pass
-
-            # d) Python allocator
-            try:
-                import sys as _sys
-                logger.warning(f"[vcr-pyalloc] n={n} allocated_blocks={_sys.getallocatedblocks()}")
-            except Exception:
-                pass
-
-            # e) gc + ssl + urllib3 counts
-            try:
-                import gc
-                import ssl as _ssl
-                gc.collect()
-                type_counts: dict[str, int] = {}
-                large_bytes_count = 0
-                large_bytes_total = 0
-                ssl_socket_count = 0
-                ssl_ctx_count = 0
-                urllib3_conn_count = 0
-                try:
-                    from urllib3.connection import HTTPSConnection as _HTTPSConn
-                    _has_https_conn = True
-                except Exception:
-                    _has_https_conn = False
-                    _HTTPSConn = None  # type: ignore[assignment,misc]
-                for obj in gc.get_objects():
-                    t = type(obj)
-                    tname = t.__qualname__
-                    type_counts[tname] = type_counts.get(tname, 0) + 1
-                    if isinstance(obj, (bytes, bytearray)) and len(obj) > 10_000:
-                        large_bytes_count += 1
-                        large_bytes_total += len(obj)
-                    if isinstance(obj, _ssl.SSLSocket):
-                        ssl_socket_count += 1
-                    elif isinstance(obj, _ssl.SSLContext):
-                        ssl_ctx_count += 1
-                    elif _has_https_conn and isinstance(obj, _HTTPSConn):
-                        urllib3_conn_count += 1
-                top_types = sorted(type_counts.items(), key=lambda x: -x[1])[:10]
-                logger.warning(
-                    f"[vcr-gc] n={n} "
-                    f"gc_objects={sum(type_counts.values())} "
-                    f"top_types={top_types}"
-                )
-                logger.warning(
-                    f"[vcr-gc] n={n} "
-                    f"large_bytes_count={large_bytes_count} "
-                    f"large_bytes_total={large_bytes_total // 1024}KB"
-                )
-                logger.warning(
-                    f"[vcr-gc] n={n} "
-                    f"ssl_sockets={ssl_socket_count} "
-                    f"ssl_contexts={ssl_ctx_count} "
-                    f"urllib3_https_conns={urllib3_conn_count}"
-                )
-            except Exception:
-                pass
-
-            # Cassette state (preserved from original diagnostics)
-            try:
-                cassette = getattr(self, "_diag_cassette", None)
-                if cassette is not None:
-                    logger.warning(
-                        f"[vcr-gc] n={n} "
-                        f"cassette.data={len(cassette.data)} "
-                        f"cassette._old_interactions={len(getattr(cassette, '_old_interactions', []))} "
-                        f"cassette.responses={len(getattr(cassette, 'responses', {}))}"
-                    )
-            except Exception:
-                pass
-
-            # f) tracemalloc rolling snapshots
-            try:
-                import tracemalloc as _tracemalloc
-                if _tracemalloc.is_tracing():
-                    snapshot = _tracemalloc.take_snapshot()
-                    total_live = sum(s.size for s in snapshot.statistics("lineno"))
-                    prev_snapshot = getattr(self, "_prev_tmalloc_snapshot", None)
-                    prev_n = getattr(self, "_prev_tmalloc_n", None)
-                    if prev_snapshot is None:
-                        logger.warning(
-                            f"[vcr-tmalloc] n={n} total_live={total_live // 1024}KB baseline"
-                        )
-                    else:
-                        stats = snapshot.compare_to(prev_snapshot, "lineno")
-                        net_new = sum(s.size_diff for s in stats if s.size_diff > 0)
-                        logger.warning(
-                            f"[vcr-tmalloc] n={n} "
-                            f"total_live={total_live // 1024}KB "
-                            f"net_new={net_new // 1024}KB (since n={prev_n})"
-                        )
-                        grown = sorted(
-                            [s for s in stats if s.size_diff > 0],
-                            key=lambda s: -s.size_diff
-                        )[:20]
-                        for s in grown:
-                            tb = s.traceback
-                            loc = f"{tb[0].filename}:{tb[0].lineno}" if tb else "unknown"
-                            logger.warning(
-                                f"[vcr-tmalloc] +{s.size_diff // 1024} KiB "
-                                f"count=+{s.count_diff} {loc}"
-                            )
-                        shrunk = sorted(
-                            [s for s in stats if s.size_diff < 0],
-                            key=lambda s: s.size_diff
-                        )[:5]
-                        for s in shrunk:
-                            tb = s.traceback
-                            loc = f"{tb[0].filename}:{tb[0].lineno}" if tb else "unknown"
-                            logger.warning(
-                                f"[vcr-tmalloc] {s.size_diff // 1024} KiB "
-                                f"count={s.count_diff} {loc}"
-                            )
-                    self._prev_tmalloc_snapshot = snapshot
-                    self._prev_tmalloc_n = n
-            except Exception:
-                pass
-
-            # g) urllib3 pool introspection
-            try:
-                import gc
-                from urllib3 import HTTPConnectionPool
-                pools = []
-                for obj in gc.get_objects():
-                    if isinstance(obj, HTTPConnectionPool):
-                        pool_q = getattr(obj, "pool", None)
-                        qsize = getattr(pool_q, "qsize", lambda: "?")()
-                        pools.append(f"{obj.host}:{obj.port}(q={qsize})")
-                logger.warning(
-                    f"[vcr-pool] n={n} urllib3_pools={len(pools)} {pools[:10]}"
-                )
-            except Exception:
-                pass
 
     def _resolve_freeze_time(self) -> str | None:
         """Resolve effective freeze_time, reading from metadata if 'auto'."""
@@ -1160,83 +934,6 @@ def _pool_reuse_patch():
                 pass
         _shared_pools.clear()
         logger.warning(f"[vcr-pool-fix] pool reuse patch removed — had {n_pools} shared pool(s)")
-
-
-def _get_smaps_rollup() -> dict[str, int]:
-    """Parse /proc/self/smaps_rollup and return field→KB mapping. Returns {} on error."""
-    try:
-        result: dict[str, int] = {}
-        with open("/proc/self/smaps_rollup") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2 and parts[-1] == "kB":
-                    key = parts[0].rstrip(":")
-                    try:
-                        result[key] = int(parts[1])
-                    except ValueError:
-                        pass
-        return result
-    except Exception:
-        return {}
-
-
-def _get_mallinfo() -> dict[str, int]:
-    """Call glibc mallinfo2 via ctypes to get heap stats. Returns {} on error."""
-    try:
-        import ctypes
-
-        class _Mallinfo2(ctypes.Structure):
-            _fields_ = [
-                ("arena", ctypes.c_size_t),
-                ("ordblks", ctypes.c_size_t),
-                ("smblks", ctypes.c_size_t),
-                ("hblks", ctypes.c_size_t),
-                ("hblkhd", ctypes.c_size_t),
-                ("usmblks", ctypes.c_size_t),
-                ("fsmblks", ctypes.c_size_t),
-                ("uordblks", ctypes.c_size_t),
-                ("fordblks", ctypes.c_size_t),
-                ("keepcost", ctypes.c_size_t),
-            ]
-
-        libc = ctypes.CDLL("libc.so.6")
-        libc.mallinfo2.restype = _Mallinfo2
-        info = libc.mallinfo2()
-        return {
-            "arena": info.arena,
-            "uordblks": info.uordblks,
-            "fordblks": info.fordblks,
-            "hblks": info.hblks,
-            "hblkhd": info.hblkhd,
-        }
-    except Exception:
-        return {}
-
-
-def _get_fd_count() -> int:
-    """Count open file descriptors in /proc/self/fd. Returns -1 on error."""
-    try:
-        return len(os.listdir("/proc/self/fd"))
-    except Exception:
-        return -1
-
-
-def _trim_process_memory() -> None:
-    """Return freed heap pages to OS. Prevents RSS growth from memory fragmentation.
-
-    Calls gc.collect() to finalize any pending circular references,
-    then malloc_trim(0) to release empty glibc arenas back to the OS (Linux only).
-    Silently no-ops on non-Linux platforms.
-    """
-    import gc
-
-    gc.collect()
-    try:
-        import ctypes
-
-        ctypes.CDLL(None).malloc_trim(0)
-    except Exception:
-        pass
 
 
 def _zero_copy_vcr_response_init(self_resp, recorded_response, *, original_init) -> None:
