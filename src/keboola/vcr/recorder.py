@@ -69,7 +69,7 @@ try:
             return False
 
         _VCRConnection.is_connected = _vcr_is_connected  # type: ignore[attr-defined]
-        del _vcr_is_connected, _VCRHTTPConnection, _VCRConnection, _VCRFakeSocket
+        del _vcr_is_connected, _VCRHTTPConnection, _VCRConnection
     except Exception:
         pass
     # --- end urllib3 connection-reuse fix ---

@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 
-
 class BaseSanitizer(ABC):
     """
     Base class for request/response sanitization.
