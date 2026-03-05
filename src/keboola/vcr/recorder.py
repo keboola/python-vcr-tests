@@ -62,6 +62,18 @@ try:
         pass
     # --- end urllib3 connection-reuse fix ---
 
+    # --- VCRHTTPResponse missing lifecycle methods fix ---
+    # urllib3 and requests call release_conn() / drain_conn() on response.raw after
+    # consuming a response to return the connection to the pool.  VCRHTTPResponse
+    # only has drain_conn() (added in vcrpy 6.x) but is missing release_conn().
+    # Without it, AttributeError is silently swallowed by urllib3's PoolManager and
+    # the connection slot is never returned — objects accumulate in the pool and RSS
+    # grows steadily.  Adding no-ops here is safe: VCR connections are not real sockets
+    # so there is nothing to actually release.
+    if not hasattr(_VCRHTTPResponse, "release_conn"):
+        _VCRHTTPResponse.release_conn = lambda self: None  # type: ignore[attr-defined]
+    # --- end VCRHTTPResponse missing lifecycle methods fix ---
+
 except ImportError:
     vcr = None  # type: ignore
     _VCRHTTPResponse = None  # type: ignore
