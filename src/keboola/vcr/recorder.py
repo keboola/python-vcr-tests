@@ -220,10 +220,6 @@ class VCRRecorder:
         # sanitization runs during replay (needed for matching).
         self._is_replaying = False
 
-        # Profiling counters (always-on during recording, zero cost during replay)
-        self._prof_skip_count = 0
-        self._prof_parse_count = 0
-
         # Configure VCR
         self._vcr = self._create_vcr_instance()
 
