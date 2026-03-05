@@ -29,9 +29,18 @@ try:
 except ImportError:
     freeze_time = None  # type: ignore
 
-from .sanitizers import BaseSanitizer, CompositeSanitizer, DefaultSanitizer, create_default_sanitizer, extract_values
+from .sanitizers import (
+    BaseSanitizer,
+    CompositeSanitizer,
+    DefaultSanitizer,
+    _dedup_sanitizers,
+    create_default_sanitizer,
+    extract_values,
+)
 
 logger = logging.getLogger(__name__)
+
+_TRIM_INTERVAL = 50  # call malloc_trim every N recorded interactions
 
 
 class VCRRecorderError(Exception):
@@ -223,6 +232,7 @@ class VCRRecorder:
         chain: list[BaseSanitizer] = [DefaultSanitizer(config=config, sensitive_values=secret_values)]
         if sanitizers:
             chain.extend(sanitizers)
+        chain = _dedup_sanitizers(chain)
 
         recorder = cls(
             cassette_dir=output_dir,
@@ -432,6 +442,12 @@ class VCRRecorder:
                 sort_keys=True,
             )
             f.write("\n")
+
+        # Periodically release freed pages back to OS to prevent RSS growth
+        # from memory fragmentation across long-running recordings.
+        self._interaction_count = getattr(self, "_interaction_count", 0) + 1
+        if self._interaction_count % _TRIM_INTERVAL == 0:
+            _trim_process_memory()
 
     def _resolve_freeze_time(self) -> str | None:
         """Resolve effective freeze_time, reading from metadata if 'auto'."""
@@ -698,6 +714,24 @@ class _VCRRecordingReader:
         assembled ``response._content``.
         """
         return memoryview(self._data)
+
+
+def _trim_process_memory() -> None:
+    """Return freed heap pages to OS. Prevents RSS growth from memory fragmentation.
+
+    Calls gc.collect() to finalize any pending circular references,
+    then malloc_trim(0) to release empty glibc arenas back to the OS (Linux only).
+    Silently no-ops on non-Linux platforms.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import ctypes
+
+        ctypes.CDLL(None).malloc_trim(0)
+    except Exception:
+        pass
 
 
 def _zero_copy_vcr_response_init(self_resp, recorded_response, *, original_init) -> None:
