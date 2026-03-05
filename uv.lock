@@ -164,7 +164,7 @@ wheels = [
 
 [[package]]
 name = "keboola-vcr"
-version = "0.1.7"
+version = "0.1.10"
 source = { editable = "." }
 dependencies = [
     { name = "freezegun" },
