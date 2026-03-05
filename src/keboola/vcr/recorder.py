@@ -29,7 +29,14 @@ try:
 except ImportError:
     freeze_time = None  # type: ignore
 
-from .sanitizers import BaseSanitizer, CompositeSanitizer, DefaultSanitizer, create_default_sanitizer, extract_values
+from .sanitizers import (
+    BaseSanitizer,
+    CompositeSanitizer,
+    DefaultSanitizer,
+    _dedup_sanitizers,
+    create_default_sanitizer,
+    extract_values,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +230,7 @@ class VCRRecorder:
         chain: list[BaseSanitizer] = [DefaultSanitizer(config=config, sensitive_values=secret_values)]
         if sanitizers:
             chain.extend(sanitizers)
+        chain = _dedup_sanitizers(chain)
 
         recorder = cls(
             cassette_dir=output_dir,
