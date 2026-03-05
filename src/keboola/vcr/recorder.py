@@ -25,17 +25,23 @@ try:
     # urllib3's pool calls is_connection_dropped(conn) → not conn.is_connected before
     # reusing a connection.  VCRConnection doesn't define is_connected, so __getattr__
     # delegates to real_connection.is_connected, which checks real_connection.sock.
-    # During VCR recording, Facebook's API responds with Connection: close, which closes
-    # real_connection.sock.  urllib3 then sees is_connected=False and creates a NEW
-    # VCRHTTPConnection + real_connection + ssl_context per interaction.  The old
-    # objects are not GC'd immediately (GC runs every 50 interactions), so with ~1.6
-    # Connection-close interactions per request, ~80 dead ssl_contexts accumulate between
-    # GC runs — each holding OpenSSL C-level state (~100 KB) → ~8 MB/50 interactions.
-    # Patching is_connected to return True when a VCRFakeSocket is present tells urllib3
-    # the connection is alive so it reuses the existing VCRHTTPConnection + ssl_context.
-    # Real reconnection still happens via real_connection.connect(), but uses the same
-    # ssl_context (enabling TLS session resumption and capping live ssl_contexts at the
-    # pool maxsize of 10 rather than letting them accumulate unboundedly).
+    #
+    # During VCR RECORDING, APIs like Facebook respond with Connection: close, which
+    # closes real_connection.sock.  urllib3 then sees is_connected=False and calls
+    # _new_conn(), creating a NEW VCRHTTPConnection + real_connection + ssl_context
+    # per interaction.  Each ssl_context loads the system CA trust store into OpenSSL
+    # C-heap (~480 KB), so 1.6 Connection-close responses per interaction × ~480 KB
+    # ≈ 770 KB/interaction of C-heap growth — matching the observed RSS growth rate.
+    # This C-heap growth does NOT appear in tracemalloc (Python-only) and is not
+    # released by gc.collect() + malloc_trim because jemalloc manages it differently.
+    #
+    # During VCR REPLAY, VCRFakeSocket replaces the real socket, so is_connected on
+    # the real_connection is always False even though the VCR stub is perfectly usable.
+    #
+    # Fix: always return True when real_connection exists (recording) or a VCRFakeSocket
+    # is present (replay).  http.client.HTTPConnection auto-reconnects on its next
+    # send() if the socket has been closed — so reusing the VCRHTTPConnection is safe
+    # and reuses the existing ssl_context instead of loading the CA store again.
     try:
         from vcr.stubs import VCRFakeSocket as _VCRFakeSocket
 
@@ -50,10 +56,15 @@ try:
         def _vcr_is_connected(self) -> bool:
             sock = getattr(self, "_sock", None)
             if isinstance(sock, _VCRFakeSocket):
-                return True  # fake socket → we're in VCR mode, report as connected
+                return True  # VCR replay: fake socket is always "connected"
             rc = getattr(self, "real_connection", None)
             if rc is not None:
-                return bool(getattr(rc, "is_connected", False))
+                # VCR recording: always claim connected so urllib3 reuses this
+                # VCRHTTPConnection and its ssl_context instead of calling _new_conn().
+                # http.client.HTTPConnection.send() calls connect() automatically when
+                # the socket has been closed (Connection: close), so the real connection
+                # is re-established transparently on the next request.
+                return True
             return False
 
         _VCRConnection.is_connected = _vcr_is_connected  # type: ignore[attr-defined]

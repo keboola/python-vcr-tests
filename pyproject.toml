@@ -1,6 +1,6 @@
 [project]
 name = "keboola.vcr"
-version = "0.1.12"
+version = "0.1.13"
 description = "VCR recording, sanitization, and validation for Keboola component HTTP interactions"
 readme = "README.md"
 license = {text = "MIT"}
