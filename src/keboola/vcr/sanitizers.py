@@ -227,7 +227,7 @@ class DefaultSanitizer(BaseSanitizer):
                 result[key] = value
         return result
 
-    def merge(self, other: "DefaultSanitizer") -> "DefaultSanitizer":
+    def merge(self, other: DefaultSanitizer) -> DefaultSanitizer:
         """Merge two DefaultSanitizers into one, unioning all their fields."""
         merged = DefaultSanitizer.__new__(DefaultSanitizer)
         merged.sensitive_fields = self.sensitive_fields | other.sensitive_fields
@@ -323,7 +323,7 @@ class TokenSanitizer(BaseSanitizer):
         self.tokens = [t for t in tokens if t]  # Filter out empty strings
         self.replacement = replacement
 
-    def merge(self, other: "TokenSanitizer") -> "TokenSanitizer":
+    def merge(self, other: TokenSanitizer) -> TokenSanitizer:
         """Merge two TokenSanitizers into one, unioning their token lists."""
         return TokenSanitizer(
             tokens=list(dict.fromkeys(self.tokens + other.tokens)),
@@ -459,7 +459,7 @@ class HeaderSanitizer(BaseSanitizer):
 
         self.headers_to_remove = set(h.lower() for h in (headers_to_remove or []))
 
-    def merge(self, other: "HeaderSanitizer") -> "HeaderSanitizer":
+    def merge(self, other: HeaderSanitizer) -> HeaderSanitizer:
         """Merge two HeaderSanitizers into one, unioning their header sets."""
         merged = HeaderSanitizer.__new__(HeaderSanitizer)
         merged.safe_headers = self.safe_headers | other.safe_headers
@@ -584,7 +584,7 @@ class QueryParamSanitizer(BaseSanitizer):
         # Build regex patterns for each parameter
         self._patterns = [re.compile(rf"({re.escape(param)}=)[^&\"\s]+") for param in self.parameters]
 
-    def merge(self, other: "QueryParamSanitizer") -> "QueryParamSanitizer":
+    def merge(self, other: QueryParamSanitizer) -> QueryParamSanitizer:
         """Merge two QueryParamSanitizers into one, unioning their parameter lists."""
         return QueryParamSanitizer(
             parameters=list(dict.fromkeys(self.parameters + other.parameters)),
@@ -634,7 +634,7 @@ class UrlPatternSanitizer(BaseSanitizer):
         self._raw_patterns = patterns  # stored for merge()
         self.patterns = [(re.compile(p), r) for p, r in patterns]
 
-    def merge(self, other: "UrlPatternSanitizer") -> "UrlPatternSanitizer":
+    def merge(self, other: UrlPatternSanitizer) -> UrlPatternSanitizer:
         """Merge two UrlPatternSanitizers into one, unioning their pattern lists."""
         seen = set()
         combined = []
@@ -695,7 +695,7 @@ class ResponseUrlSanitizer(BaseSanitizer):
         domain_alts = "|".join(re.escape(d) for d in url_domains)
         self._url_re = re.compile(rf'https?://[^\s"\'<>]*(?:{domain_alts})[^\s"\'<>]*')
 
-    def merge(self, other: "ResponseUrlSanitizer") -> "ResponseUrlSanitizer":
+    def merge(self, other: ResponseUrlSanitizer) -> ResponseUrlSanitizer:
         """Merge two ResponseUrlSanitizers into one, unioning their params and domains."""
         return ResponseUrlSanitizer(
             dynamic_params=list(dict.fromkeys(self.dynamic_params + other.dynamic_params)),
