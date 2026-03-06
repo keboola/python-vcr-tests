@@ -522,7 +522,7 @@ class VCRRecorder:
             return
 
         with open(temp_path, "a") as f:
-            _write_interaction_chunked(f, filtered_request._to_dict(), filtered_response)
+            _write_interaction(f, filtered_request._to_dict(), filtered_response)
 
     def _resolve_freeze_time(self) -> str | None:
         """Resolve effective freeze_time, reading from metadata if 'auto'."""
@@ -791,7 +791,7 @@ class _VCRRecordingReader:
         return memoryview(self._data)
 
 
-def _write_interaction_chunked(f: IO[str], req_dict: dict, response: dict) -> None:
+def _write_interaction(f: IO[str], req_dict: dict, response: dict) -> None:
     """Serialize a VCR interaction to f as a JSONL record."""
     json.dump({"request": req_dict, "response": response}, f, cls=_BytesEncoder, sort_keys=True)
     f.write("\n")
