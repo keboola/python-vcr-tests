@@ -16,7 +16,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import IO, Any, Callable
 
 try:
     import vcr
@@ -791,7 +791,7 @@ class _VCRRecordingReader:
         return memoryview(self._data)
 
 
-def _write_json_string_chunked(f, s: str, chunk_size: int = 65536) -> None:
+def _write_json_string_chunked(f: IO[str], s: str, chunk_size: int = 65536) -> None:
     """Write a JSON-encoded string to f in 64 KB chunks.
 
     json.dumps(large_string) allocates the entire escaped form at once, which
@@ -806,7 +806,7 @@ def _write_json_string_chunked(f, s: str, chunk_size: int = 65536) -> None:
     f.write('"')
 
 
-def _write_interaction_chunked(f, req_dict: dict, response: dict) -> None:
+def _write_interaction_chunked(f: IO[str], req_dict: dict, response: dict) -> None:
     """Serialize a VCR interaction to f as a JSONL record.
 
     The response body string is written in 64 KB chunks (see _write_json_string_chunked)
