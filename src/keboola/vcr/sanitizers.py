@@ -229,19 +229,13 @@ class DefaultSanitizer(BaseSanitizer):
 
     def merge(self, other: DefaultSanitizer) -> DefaultSanitizer:
         """Merge two DefaultSanitizers into one, unioning all their fields."""
-        merged = DefaultSanitizer.__new__(DefaultSanitizer)
-        merged.sensitive_fields = self.sensitive_fields | other.sensitive_fields
-        merged.safe_headers = self.safe_headers | other.safe_headers
-        merged.replacement = self.replacement
-        seen = set()
-        combined_values = []
-        for v in self.sensitive_values + other.sensitive_values:
-            if v not in seen:
-                seen.add(v)
-                combined_values.append(v)
-        merged.sensitive_values = sorted(combined_values, key=len, reverse=True)
-        merged._field_patterns = [re.compile(rf"({re.escape(f)}=)[^&\"\s]+") for f in merged.sensitive_fields]
-        return merged
+        merged_values = list(dict.fromkeys(self.sensitive_values + other.sensitive_values))
+        return DefaultSanitizer(
+            sensitive_fields=list(self.sensitive_fields | other.sensitive_fields),
+            safe_headers=list(self.safe_headers | other.safe_headers),
+            sensitive_values=merged_values,
+            replacement=self.replacement,
+        )
 
     # -- Applied uniformly to requests and responses --
 
