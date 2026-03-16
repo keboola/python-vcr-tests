@@ -146,7 +146,22 @@ class DefaultSanitizer(BaseSanitizer):
         if not body:
             return body
 
-        # 1. Try JSON
+        # Quick pre-scan: skip expensive JSON parse if no sensitive content is present.
+        # Use quoted field names for JSON key matching (avoids false positives from substrings).
+        needs_json_sanitization = any(f'"{field}"' in body for field in self.sensitive_fields) or any(
+            value in body for value in self.sensitive_values
+        )
+        if not needs_json_sanitization:
+            # Still apply form-encoded / exact value checks (cheap string ops)
+            result = body
+            for pattern in self._field_patterns:
+                result = pattern.sub(rf"\1{self.replacement}", result)
+            for value in self.sensitive_values:
+                if value in result:
+                    result = result.replace(value, self.replacement)
+            return result
+
+        # 1. Try JSON (only when pre-scan found a potential sensitive field/value)
         try:
             data = json.loads(body)
             changed = [False]
@@ -211,6 +226,16 @@ class DefaultSanitizer(BaseSanitizer):
             if key.lower() in self.safe_headers:
                 result[key] = value
         return result
+
+    def merge(self, other: DefaultSanitizer) -> DefaultSanitizer:
+        """Merge two DefaultSanitizers into one, unioning all their fields."""
+        merged_values = list(dict.fromkeys(self.sensitive_values + other.sensitive_values))
+        return DefaultSanitizer(
+            sensitive_fields=list(self.sensitive_fields | other.sensitive_fields),
+            safe_headers=list(self.safe_headers | other.safe_headers),
+            sensitive_values=merged_values,
+            replacement=self.replacement,
+        )
 
     # -- Applied uniformly to requests and responses --
 
@@ -291,6 +316,13 @@ class TokenSanitizer(BaseSanitizer):
         """
         self.tokens = [t for t in tokens if t]  # Filter out empty strings
         self.replacement = replacement
+
+    def merge(self, other: TokenSanitizer) -> TokenSanitizer:
+        """Merge two TokenSanitizers into one, unioning their token lists."""
+        return TokenSanitizer(
+            tokens=list(dict.fromkeys(self.tokens + other.tokens)),
+            replacement=self.replacement,
+        )
 
     def _sanitize_string(self, value: str) -> str:
         """Replace all tokens in a string."""
@@ -421,6 +453,13 @@ class HeaderSanitizer(BaseSanitizer):
 
         self.headers_to_remove = set(h.lower() for h in (headers_to_remove or []))
 
+    def merge(self, other: HeaderSanitizer) -> HeaderSanitizer:
+        """Merge two HeaderSanitizers into one, unioning their header sets."""
+        return HeaderSanitizer(
+            safe_headers=list(self.safe_headers | other.safe_headers),
+            headers_to_remove=list(self.headers_to_remove | other.headers_to_remove),
+        )
+
     def _filter_headers(self, headers: dict) -> dict:
         """Filter headers to only include safe ones."""
         result = {}
@@ -539,6 +578,13 @@ class QueryParamSanitizer(BaseSanitizer):
         # Build regex patterns for each parameter
         self._patterns = [re.compile(rf"({re.escape(param)}=)[^&\"\s]+") for param in self.parameters]
 
+    def merge(self, other: QueryParamSanitizer) -> QueryParamSanitizer:
+        """Merge two QueryParamSanitizers into one, unioning their parameter lists."""
+        return QueryParamSanitizer(
+            parameters=list(dict.fromkeys(self.parameters + other.parameters)),
+            replacement=self.replacement,
+        )
+
     def _sanitize_string(self, value: str) -> str:
         """Replace parameter values in a string."""
         for pattern in self._patterns:
@@ -579,7 +625,19 @@ class UrlPatternSanitizer(BaseSanitizer):
                       Pattern is a regex string, replacement is the string
                       to use for matches.
         """
+        self._raw_patterns = patterns  # stored for merge()
         self.patterns = [(re.compile(p), r) for p, r in patterns]
+
+    def merge(self, other: UrlPatternSanitizer) -> UrlPatternSanitizer:
+        """Merge two UrlPatternSanitizers into one, unioning their pattern lists."""
+        seen = set()
+        combined = []
+        for p, r in self._raw_patterns + other._raw_patterns:
+            key = (p, r)
+            if key not in seen:
+                seen.add(key)
+                combined.append((p, r))
+        return UrlPatternSanitizer(patterns=combined)
 
     def _sanitize_url(self, url: str) -> str:
         """Apply all patterns to the URL."""
@@ -620,6 +678,7 @@ class ResponseUrlSanitizer(BaseSanitizer):
             dynamic_params: Query parameter names to strip from matching URLs.
             url_domains: Domain substrings that identify URLs to sanitize.
         """
+        self.dynamic_params = dynamic_params  # stored for merge()
         self.url_domains = url_domains
         # Build a single regex that matches any of the dynamic params as
         # query-string key=value pairs (including leading & or ?).
@@ -629,6 +688,13 @@ class ResponseUrlSanitizer(BaseSanitizer):
         # Pre-compile URL regex for matching target-domain URLs in body strings
         domain_alts = "|".join(re.escape(d) for d in url_domains)
         self._url_re = re.compile(rf'https?://[^\s"\'<>]*(?:{domain_alts})[^\s"\'<>]*')
+
+    def merge(self, other: ResponseUrlSanitizer) -> ResponseUrlSanitizer:
+        """Merge two ResponseUrlSanitizers into one, unioning their params and domains."""
+        return ResponseUrlSanitizer(
+            dynamic_params=list(dict.fromkeys(self.dynamic_params + other.dynamic_params)),
+            url_domains=list(dict.fromkeys(self.url_domains + other.url_domains)),
+        )
 
     def _body_has_matching_domain(self, body_str: str) -> bool:
         """Quick check whether the body contains any target domain."""
@@ -783,6 +849,24 @@ class ConfigSecretsSanitizer(BaseSanitizer):
                     body["string"] = self._sanitize_string(body_str).encode("utf-8")
 
         return response
+
+
+def _dedup_sanitizers(sanitizers: list["BaseSanitizer"]) -> list["BaseSanitizer"]:
+    """Merge same-class sanitizers to avoid redundant processing passes.
+
+    Preserves order (first occurrence of each class keeps its position).
+    Sanitizer classes without a ``merge()`` method are kept as-is.
+    """
+    result: list[BaseSanitizer] = []
+    by_class: dict[type, int] = {}  # class → index in result
+    for s in sanitizers:
+        cls = type(s)
+        if cls in by_class and hasattr(result[by_class[cls]], "merge"):
+            result[by_class[cls]] = result[by_class[cls]].merge(s)
+        else:
+            by_class[cls] = len(result)
+            result.append(s)
+    return result
 
 
 def create_default_sanitizer(secrets: dict[str, Any]) -> DefaultSanitizer:
