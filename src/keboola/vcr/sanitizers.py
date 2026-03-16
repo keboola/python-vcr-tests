@@ -455,10 +455,10 @@ class HeaderSanitizer(BaseSanitizer):
 
     def merge(self, other: HeaderSanitizer) -> HeaderSanitizer:
         """Merge two HeaderSanitizers into one, unioning their header sets."""
-        merged = HeaderSanitizer.__new__(HeaderSanitizer)
-        merged.safe_headers = self.safe_headers | other.safe_headers
-        merged.headers_to_remove = self.headers_to_remove | other.headers_to_remove
-        return merged
+        return HeaderSanitizer(
+            safe_headers=list(self.safe_headers | other.safe_headers),
+            headers_to_remove=list(self.headers_to_remove | other.headers_to_remove),
+        )
 
     def _filter_headers(self, headers: dict) -> dict:
         """Filter headers to only include safe ones."""
