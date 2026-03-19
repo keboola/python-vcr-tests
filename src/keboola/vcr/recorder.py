@@ -15,7 +15,7 @@ import json
 import logging
 import os
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any
 
@@ -422,7 +422,7 @@ class VCRRecorder:
             _VCRHTTPResponse.__init__ = _original_vcr_init
 
         metadata = {
-            "recorded_at": datetime.now(UTC).isoformat(),
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
             "freeze_time": self.freeze_time_at,
             "keboola_vcr_version": self._get_version(),
         }
