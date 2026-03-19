@@ -793,7 +793,7 @@ class ConfigSecretsSanitizer(BaseSanitizer):
     def from_config_file(cls, config_path, **kwargs) -> ConfigSecretsSanitizer:
         """Load config.json and auto-detect #-prefixed secrets."""
         config_path = Path(config_path)
-        with open(config_path, "r") as f:
+        with open(config_path) as f:
             config = json.load(f)
         return cls(config=config, **kwargs)
 
@@ -851,7 +851,7 @@ class ConfigSecretsSanitizer(BaseSanitizer):
         return response
 
 
-def _dedup_sanitizers(sanitizers: list["BaseSanitizer"]) -> list["BaseSanitizer"]:
+def _dedup_sanitizers(sanitizers: list[BaseSanitizer]) -> list[BaseSanitizer]:
     """Merge same-class sanitizers to avoid redundant processing passes.
 
     Preserves order (first occurrence of each class keeps its position).

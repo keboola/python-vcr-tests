@@ -14,9 +14,10 @@ import functools
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, Callable
+from typing import IO, Any
 
 try:
     import vcr
@@ -97,6 +98,7 @@ try:
     # the pool queue so it can be reused on the next request, where vcrpy replaces the
     # socket with a VCRFakeSocket / real_connection reconnect as usual.
     if not hasattr(_VCRHTTPResponse, "release_conn"):
+
         def _vcr_release_conn(self) -> None:  # noqa: E306
             pool = getattr(self, "_pool", None)
             conn = getattr(self, "_connection", None)
@@ -418,7 +420,7 @@ class VCRRecorder:
             _VCRHTTPResponse.__init__ = _original_vcr_init
 
         metadata = {
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "recorded_at": datetime.now(UTC).isoformat(),
             "freeze_time": self.freeze_time_at,
             "keboola_vcr_version": self._get_version(),
         }
@@ -494,7 +496,7 @@ class VCRRecorder:
         cassette_path = Path(cassette_path)
         if not cassette_path.exists():
             return {}
-        with open(cassette_path, "r") as f:
+        with open(cassette_path) as f:
             data = json.load(f)
         return data.get("_metadata", {})
 
@@ -620,7 +622,7 @@ class VCRRecorder:
                 config_path = test_data_dir / "config.json"
                 config = {}
                 if config_path.exists():
-                    with open(config_path, "r") as f:
+                    with open(config_path) as f:
                         config = json.load(f)
                 return module.get_sanitizers(config)
         except Exception as e:
@@ -633,7 +635,7 @@ class VCRRecorder:
         """Load secrets from JSON file if it exists."""
         if secrets_path.exists():
             try:
-                with open(secrets_path, "r") as f:
+                with open(secrets_path) as f:
                     return json.load(f)
             except (json.JSONDecodeError, OSError) as e:
                 raise SecretsLoadError(f"Failed to load secrets from {secrets_path}: {e}")
@@ -796,6 +798,7 @@ def _write_interaction(f: IO[str], req_dict: dict, response: dict) -> None:
     json.dump({"request": req_dict, "response": response}, f, cls=_BytesEncoder, sort_keys=True)
     f.write("\n")
 
+
 @contextlib.contextmanager
 def _pool_reuse_patch():
     """Prevent urllib3 connection pool proliferation during VCR recording.
@@ -851,6 +854,7 @@ def _pool_reuse_patch():
             return
         try:
             from urllib3.util.ssl_ import create_urllib3_context
+
             ctx = create_urllib3_context()
             # load_default_certs() is only called by urllib3 when it creates its own
             # context (default_ssl_context=True).  Since we supply one, we must call

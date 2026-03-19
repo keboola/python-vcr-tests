@@ -247,7 +247,7 @@ class OutputSnapshot:
         Raises:
             FileNotFoundError: If snapshot file doesn't exist
         """
-        with open(snapshot_path, "r") as f:
+        with open(snapshot_path) as f:
             return json.load(f)
 
     def _compare_section(
@@ -338,9 +338,9 @@ class OutputSnapshot:
     ) -> str | None:
         """Generate unified diff between two files."""
         try:
-            with open(expected_path, "r", encoding="utf-8") as f:
+            with open(expected_path, encoding="utf-8") as f:
                 expected_lines = f.readlines()
-            with open(actual_path, "r", encoding="utf-8") as f:
+            with open(actual_path, encoding="utf-8") as f:
                 actual_lines = f.readlines()
 
             diff = list(
@@ -363,7 +363,7 @@ class OutputSnapshot:
     def _get_csv_metadata(self, file_path: Path) -> tuple[int | None, list[str] | None]:
         """Extract metadata from a CSV file."""
         try:
-            with open(file_path, "r", newline="", encoding="utf-8") as f:
+            with open(file_path, newline="", encoding="utf-8") as f:
                 reader = csv.reader(f)
                 try:
                     header = next(reader)
