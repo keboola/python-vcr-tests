@@ -343,6 +343,12 @@ class TestScaffolder:
         with open(source_data_dir / "config.json", "w") as f:
             json.dump(recording_config, f, indent=2)
 
+        # Load component-defined sanitizers (e.g. GCS signed URL redaction) so
+        # that scaffold recording applies the same sanitizers as test replay.
+        from keboola.datadirtest.vcr.tester import _load_vcr_sanitizers_from_script
+
+        component_sanitizers = _load_vcr_sanitizers_from_script(str(component_script))
+
         # Create recorder — pass secrets_override so the sanitizer knows
         # about the real credential values even though config.json on disk
         # may contain dummy placeholders.
@@ -350,6 +356,7 @@ class TestScaffolder:
             test_data_dir=source_data_dir,
             freeze_time_at=freeze_time_at,
             secrets_override=secrets_override,
+            sanitizers=component_sanitizers or None,
         )
 
         if regenerate:
