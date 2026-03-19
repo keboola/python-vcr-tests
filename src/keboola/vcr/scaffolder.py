@@ -142,7 +142,7 @@ class TestScaffolder:
             raise ScaffolderError(f"Definitions file not found: {definitions_file}")
 
         try:
-            with open(definitions_file, "r") as f:
+            with open(definitions_file) as f:
                 definitions = json.load(f)
         except json.JSONDecodeError as e:
             raise ScaffolderError(f"Invalid JSON in definitions file: {e}")
@@ -167,7 +167,7 @@ class TestScaffolder:
             if not secrets_file.exists():
                 raise ScaffolderError(f"Secrets file not found: {secrets_file}")
             try:
-                with open(secrets_file, "r") as f:
+                with open(secrets_file) as f:
                     secrets_override = json.load(f)
             except json.JSONDecodeError as e:
                 raise ScaffolderError(f"Invalid JSON in secrets file: {e}")
@@ -191,7 +191,7 @@ class TestScaffolder:
             if chain_state and record:
                 state_path = test_path / "source" / "data" / "out" / "state.json"
                 if state_path.exists():
-                    with open(state_path, "r") as f:
+                    with open(state_path) as f:
                         chained_state = json.load(f)
                     logger.info(f"Chained state from {test_path.name} for next test")
 
@@ -343,6 +343,12 @@ class TestScaffolder:
         with open(source_data_dir / "config.json", "w") as f:
             json.dump(recording_config, f, indent=2)
 
+        # Load component-defined sanitizers (e.g. GCS signed URL redaction) so
+        # that scaffold recording applies the same sanitizers as test replay.
+        from keboola.datadirtest.vcr.tester import _load_vcr_sanitizers_from_script
+
+        component_sanitizers = _load_vcr_sanitizers_from_script(str(component_script))
+
         # Create recorder — pass secrets_override so the sanitizer knows
         # about the real credential values even though config.json on disk
         # may contain dummy placeholders.
@@ -350,6 +356,7 @@ class TestScaffolder:
             test_data_dir=source_data_dir,
             freeze_time_at=freeze_time_at,
             secrets_override=secrets_override,
+            sanitizers=component_sanitizers or None,
         )
 
         if regenerate:
@@ -403,7 +410,7 @@ class TestScaffolder:
         # Priority: inline secrets → external secrets override → raw config
         secrets_path = source_data_dir / "config.secrets.json"
         if secrets_path.exists():
-            with open(secrets_path, "r") as f:
+            with open(secrets_path) as f:
                 secrets = json.load(f)
             config_with_placeholders = self._mask_secrets(config, secrets)
             with open(source_data_dir / "config.json", "w") as f:
@@ -503,7 +510,7 @@ class TestScaffolder:
     @staticmethod
     def _pretty_print_manifest(path: Path) -> None:
         """Re-serialize a .manifest file as indented JSON."""
-        with open(path, "r") as f:
+        with open(path) as f:
             data = json.load(f)
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
