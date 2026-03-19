@@ -211,11 +211,13 @@ class VCRRecorder:
         self.record_mode = record_mode
         self.match_on = match_on or ["method", "scheme", "host", "port", "path", "query"]
 
-        # Set up sanitizers
+        # Set up sanitizers — always include DefaultSanitizer so secrets from
+        # config.secrets.json are redacted even when component sanitizers are provided.
+        default = create_default_sanitizer(self.secrets)
         if sanitizers is not None:
-            self.sanitizer = CompositeSanitizer(sanitizers)
+            self.sanitizer = CompositeSanitizer([default, *sanitizers])
         else:
-            self.sanitizer = create_default_sanitizer(self.secrets)
+            self.sanitizer = default
 
         # Response sanitization is skipped during replay — cassettes already
         # contain sanitized data from when they were recorded.  Only request
