@@ -653,6 +653,17 @@ class UrlPatternSanitizer(BaseSanitizer):
         return request
 
 
+def IPv4UrlSanitizer(replacement: str = "https://REDACTED-IPV4") -> UrlPatternSanitizer:
+    """
+    Returns a UrlPatternSanitizer that replaces IPv4 addresses in request URIs
+    with a placeholder hostname.
+
+    Prevents real infrastructure IP addresses from being committed to
+    public repos when recording cassettes against dev instances.
+    """
+    return UrlPatternSanitizer(patterns=[(r"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?", replacement)])
+
+
 class ResponseUrlSanitizer(BaseSanitizer):
     """
     Sanitizes dynamic query parameters from URLs in response bodies.
