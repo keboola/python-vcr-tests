@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -157,6 +158,12 @@ class SecretsLoadError(VCRRecorderError):
     """Raised when secrets file cannot be loaded."""
 
     pass
+
+
+# Thread-local counter tracking how many VCRRecorder.replay() calls are currently
+# active in this thread (handles the case where keboola.component's own built-in
+# _execute_with_vcr_replay() creates a nested VCRRecorder during test replay).
+_replay_nesting: threading.local = threading.local()
 
 
 class VCRRecorder:
@@ -514,12 +521,29 @@ class VCRRecorder:
                 f"No cassette found at {self.cassette_path}. Run with --record flag to create one."
             )
 
+        # Track nesting: keboola.component's execute_action() may create a nested
+        # VCRRecorder when it detects a cassette (_execute_with_vcr_replay).  The
+        # outer (test-framework) recorder should skip its own sync-action comparison
+        # in that case — the inner recorder already validates it and raises RuntimeError
+        # on mismatch.
+        nesting_depth: int = getattr(_replay_nesting, "depth", 0)
+        _replay_nesting.depth = nesting_depth + 1
+        is_nested: bool = nesting_depth > 0
+        # Save and reset "nested_occurred" flag; inner recorders will set it to True.
+        prev_nested_occurred: bool = getattr(_replay_nesting, "nested_occurred", False)
+        _replay_nesting.nested_occurred = False
+
         logger.info(f"Replaying HTTP interactions from {self.cassette_path}")
 
         self.last_log_comparison = None
         self.last_sync_action_comparison = None
 
         action = self._get_action_name()
+        # Outer recorder: capture stdout so we can compare sync action output.
+        # But if we later discover a nested replay occurred (component used its own
+        # VCRRecorder), we discard this capture and let the inner recorder's
+        # comparison stand.  The inner recorder writes JSON to its own StringIO
+        # (nested redirect_stdout) so our capture would only contain VCR log messages.
         stdout_capture = io.StringIO() if action != "run" else None
 
         effective_freeze_time = self._resolve_freeze_time()
@@ -542,16 +566,36 @@ class VCRRecorder:
                 self._is_replaying = False
 
         run_result: ComponentRunResult | None = None
-        if self.capture_logs:
-            run_result = run_with_log_capture(_run_in_vcr, self.ignored_loggers)
-        else:
-            _run_in_vcr()
+        nested_occurred: bool = False
+        try:
+            if self.capture_logs:
+                run_result = run_with_log_capture(_run_in_vcr, self.ignored_loggers)
+            else:
+                _run_in_vcr()
+            # Read flag BEFORE finally restores it — inner recorders set this True.
+            nested_occurred = getattr(_replay_nesting, "nested_occurred", False)
+        finally:
+            _replay_nesting.depth = nesting_depth
+            if is_nested:
+                # Signal our parent recorder that a nested replay occurred.
+                _replay_nesting.nested_occurred = True
+            else:
+                # Outermost recorder: restore the pre-call state.
+                _replay_nesting.nested_occurred = prev_nested_occurred
 
         if stdout_capture is not None:
             self._remove_leaked_stdout_handlers(stdout_capture)
 
+        # If a nested VCRRecorder ran inside component_runner (keboola.component's
+        # _execute_with_vcr_replay), its redirect_stdout(inner_capture) captured the
+        # sync action JSON while our stdout_capture only received VCR log messages
+        # written through the StreamHandler that set_default_logger attached to
+        # sys.stdout=outer_capture.  Discard our capture in that case — the nested
+        # recorder already validated the output (raises RuntimeError on mismatch).
+        effective_stdout_capture = None if (not is_nested and nested_occurred) else stdout_capture
+
         # Check exit code and compare artefacts
-        self._assert_replay_result(run_result, stdout_capture)
+        self._assert_replay_result(run_result, effective_stdout_capture)
 
         logger.info("Replay completed successfully")
 
