@@ -195,6 +195,20 @@ def run_with_log_capture(
     # already flowing through other handlers.
     if previous_level == logging.NOTSET or previous_level > log_level:
         root_logger.setLevel(log_level)
+
+    # keboola.component's set_default_logger() calls
+    # `for h in root.handlers: root.removeHandler(h)` which has an off-by-one
+    # iteration bug — it skips alternating handlers — and may inadvertently
+    # remove our LogCaptureHandler (or fail to leave it in place consistently).
+    # Protect the handler by wrapping removeHandler to ignore our instance.
+    _original_remove_handler = root_logger.removeHandler
+
+    def _protected_remove(h: logging.Handler) -> None:
+        if h is handler:
+            return
+        _original_remove_handler(h)
+
+    root_logger.removeHandler = _protected_remove  # type: ignore[method-assign]
     root_logger.addHandler(handler)
     exit_code: int | None = None
     stderr_buf = io.StringIO()
@@ -204,6 +218,7 @@ def run_with_log_capture(
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else None
     finally:
+        root_logger.removeHandler = _original_remove_handler  # type: ignore[method-assign]
         root_logger.removeHandler(handler)
         root_logger.setLevel(previous_level)
     return ComponentRunResult(exit_code=exit_code, logs=handler.records, stderr=stderr_buf.getvalue())
