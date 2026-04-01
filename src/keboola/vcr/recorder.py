@@ -519,17 +519,20 @@ class VCRRecorder:
         action = self._get_action_name()
         stdout_capture = io.StringIO() if action != "run" else None
 
-        effective_freeze_time = self._resolve_freeze_time()
-
         if self.has_cassette():
             logger.info(f"Replaying HTTP interactions from {self.cassette_path}")
             vcr_context: Any = self._vcr.use_cassette(
                 str(self.cassette_path),
                 record_mode="none",
             )
+            effective_freeze_time = self._resolve_freeze_time()
         else:
             logger.info("No cassette found — running without HTTP replay (log/sync-action capture only)")
             vcr_context = contextlib.nullcontext()
+            # No cassette metadata to read from — honour an explicit freeze time but
+            # don't fall back to DEFAULT_FREEZE_TIME for live-network runs.
+            ft = self.freeze_time_at
+            effective_freeze_time = ft if ft and ft != "auto" else None
 
         def _run_in_vcr():
             self._is_replaying = True
@@ -743,8 +746,11 @@ class VCRRecorder:
             logger.warning("No metadata in cassette, falling back to default freeze time")
             return self.DEFAULT_FREEZE_TIME
 
-        # Prefer freeze_time (the value used during recording), fall back to recorded_at
-        resolved = metadata.get("freeze_time") or metadata.get("recorded_at", self.DEFAULT_FREEZE_TIME)
+        # Prefer freeze_time (the value used during recording), fall back to recorded_at.
+        # Treat the literal "auto" as unresolved — it means auto-mode was active during
+        # recording and the actual freeze time should come from recorded_at.
+        ft = metadata.get("freeze_time")
+        resolved = ft if (ft and ft != "auto") else metadata.get("recorded_at", self.DEFAULT_FREEZE_TIME)
         logger.info(f"Auto-resolved freeze_time from cassette metadata: {resolved}")
         return resolved
 

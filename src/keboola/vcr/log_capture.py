@@ -154,7 +154,9 @@ class LogSanitizer:
     def __init__(self, secrets: dict[str, Any]) -> None:
         from keboola.vcr.sanitizers import extract_values
 
-        self._secret_values = [str(v) for v in extract_values(secrets) if v]
+        self._secret_values = sorted(
+            [str(v) for v in extract_values(secrets) if v], key=len, reverse=True
+        )
 
     def sanitize_string(self, text: str) -> str:
         """Replace secret values in an arbitrary string."""
