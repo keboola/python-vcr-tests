@@ -468,6 +468,9 @@ class VCRRecorder:
         finally:
             _VCRHTTPResponse.__init__ = _original_vcr_init
 
+        if stdout_capture is not None:
+            self._remove_leaked_stdout_handlers(stdout_capture)
+
         if run_result is not None:
             self._save_log_artefacts(run_result, is_recording=True)
 
@@ -544,6 +547,9 @@ class VCRRecorder:
         else:
             _run_in_vcr()
 
+        if stdout_capture is not None:
+            self._remove_leaked_stdout_handlers(stdout_capture)
+
         # Check exit code and compare artefacts
         self._assert_replay_result(run_result, stdout_capture)
 
@@ -617,6 +623,22 @@ class VCRRecorder:
             except Exception:
                 pass
         return None
+
+    @staticmethod
+    def _remove_leaked_stdout_handlers(stdout_capture: io.StringIO) -> None:
+        """Remove any StreamHandlers pointing to stdout_capture from the root logger.
+
+        keboola.component's CommonInterface.__init__ adds StreamHandler(sys.stdout) to
+        the root logger. When the component runs inside redirect_stdout(stdout_capture),
+        that handler captures stdout_capture. It persists after the component returns,
+        causing subsequent logger calls (e.g. "Replay completed successfully") to write
+        into stdout_capture and contaminate the sync action JSON output.
+        """
+        root = logging.getLogger()
+        root.handlers = [
+            h for h in root.handlers
+            if not (isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is stdout_capture)
+        ]
 
     def _compare_sync_action_result(self, recorded_raw: str, replayed_raw: str) -> dict:
         """Compare two sync action stdout JSON strings. Returns dict with success and diff."""
