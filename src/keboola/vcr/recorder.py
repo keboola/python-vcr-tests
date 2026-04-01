@@ -591,13 +591,21 @@ class VCRRecorder:
             return "run"
 
     def _run_with_freeze(self, runner: Callable[[], None], freeze_time_val: str | None = None) -> None:
-        """Run runner inside optional freeze_time context."""
+        """Run runner inside optional freeze_time context.
+
+        Warning state is reset before each run so that warnings (e.g. tzlocal
+        timezone-offset mismatch triggered by freeze_time) fire consistently
+        regardless of how many tests have run in the same Python process.
+        """
+        import warnings as _warnings
         ft = freeze_time_val if freeze_time_val is not None else self.freeze_time_at
-        if ft and ft != "auto":
-            with freeze_time(ft):
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("always")
+            if ft and ft != "auto":
+                with freeze_time(ft):
+                    runner()
+            else:
                 runner()
-        else:
-            runner()
 
     def _save_log_artefacts(self, run_result: ComponentRunResult, is_recording: bool) -> None:
         """Sanitize and persist logs.json; auto-save expected_status.json on recording failure."""
