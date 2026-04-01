@@ -156,6 +156,12 @@ class LogSanitizer:
 
         self._secret_values = [str(v) for v in extract_values(secrets) if v]
 
+    def sanitize_string(self, text: str) -> str:
+        """Replace secret values in an arbitrary string."""
+        for secret in self._secret_values:
+            text = text.replace(secret, "***")
+        return text
+
     def sanitize(self, result: ComponentRunResult) -> ComponentRunResult:
         if not self._secret_values:
             return result

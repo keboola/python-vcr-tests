@@ -477,6 +477,8 @@ class VCRRecorder:
 
         if stdout_capture is not None:
             raw = stdout_capture.getvalue().strip()
+            if self.secrets:
+                raw = LogSanitizer(self.secrets).sanitize_string(raw)
             if raw:
                 self.sync_action_result_path.write_text(raw)
             else:
@@ -686,6 +688,8 @@ class VCRRecorder:
         if stdout_capture is not None and self.sync_action_result_path.exists():
             recorded_raw = self.sync_action_result_path.read_text().strip()
             replayed_raw = stdout_capture.getvalue().strip()
+            if self.secrets:
+                replayed_raw = LogSanitizer(self.secrets).sanitize_string(replayed_raw)
             self.last_sync_action_comparison = self._compare_sync_action_result(
                 recorded_raw, replayed_raw
             )
