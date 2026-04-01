@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_IGNORED_LOGGERS: frozenset[str] = frozenset(
-    {"vcr", "urllib3", "freezegun", "datadirtest", "filelock"}
+    {"vcr", "keboola.vcr", "urllib3", "freezegun", "datadirtest", "filelock"}
 )
 DEFAULT_LOG_LEVEL = logging.DEBUG
 
