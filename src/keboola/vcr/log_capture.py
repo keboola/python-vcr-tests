@@ -8,7 +8,9 @@ to detect behavioural regressions.
 
 from __future__ import annotations
 
+import contextlib
 import difflib
+import io
 import json
 import logging
 import re
@@ -41,10 +43,12 @@ class CapturedLog:
 class ComponentRunResult:
     exit_code: int | None   # None = clean exit (treated as 0), 1 = UserException, 2 = AppError
     logs: list[CapturedLog] = field(default_factory=list)
+    stderr: str = ""        # raw stderr output (e.g. sync action error messages, tracebacks)
 
     def to_dict(self) -> dict:
         return {
             "exit_code": self.exit_code,
+            "stderr": self.stderr,
             "logs": [
                 {
                     "level": log.level,
@@ -67,7 +71,7 @@ class ComponentRunResult:
             )
             for entry in data.get("logs", [])
         ]
-        return cls(exit_code=data.get("exit_code"), logs=logs)
+        return cls(exit_code=data.get("exit_code"), logs=logs, stderr=data.get("stderr", ""))
 
 
 @dataclass
@@ -161,7 +165,10 @@ class LogSanitizer:
                     timestamp=log.timestamp,
                 )
             )
-        return ComponentRunResult(exit_code=result.exit_code, logs=sanitized_logs)
+        stderr = result.stderr
+        for secret in self._secret_values:
+            stderr = stderr.replace(secret, "***")
+        return ComponentRunResult(exit_code=result.exit_code, logs=sanitized_logs, stderr=stderr)
 
 
 def run_with_log_capture(
@@ -189,14 +196,16 @@ def run_with_log_capture(
         root_logger.setLevel(log_level)
     root_logger.addHandler(handler)
     exit_code: int | None = None
+    stderr_buf = io.StringIO()
     try:
-        fn()
+        with contextlib.redirect_stderr(stderr_buf):
+            fn()
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else None
     finally:
         root_logger.removeHandler(handler)
         root_logger.setLevel(previous_level)
-    return ComponentRunResult(exit_code=exit_code, logs=handler.records)
+    return ComponentRunResult(exit_code=exit_code, logs=handler.records, stderr=stderr_buf.getvalue())
 
 
 def normalize_message(message: str, normalizers: list[tuple[str, str]]) -> str:
@@ -254,7 +263,20 @@ def compare_logs(
         )
     )
 
-    success = exit_code_match and not diffs
+    recorded_stderr = normalize_message(recorded.stderr, normalizers)
+    replayed_stderr = normalize_message(replayed.stderr, normalizers)
+    stderr_match = recorded_stderr == replayed_stderr
+    stderr_diffs = list(
+        difflib.unified_diff(
+            recorded_stderr.splitlines(),
+            replayed_stderr.splitlines(),
+            fromfile="recorded stderr",
+            tofile="replayed stderr",
+            lineterm="",
+        )
+    ) if not stderr_match else []
+
+    success = exit_code_match and not diffs and stderr_match
 
     parts = []
     if not exit_code_match:
@@ -263,11 +285,13 @@ def compare_logs(
         )
     if diffs:
         parts.append(f"Log messages differ ({len(diffs)} diff lines)")
+    if stderr_diffs:
+        parts.append(f"Stderr differs ({len(stderr_diffs)} diff lines)")
     summary = "; ".join(parts) if parts else "Logs match"
 
     return LogComparisonResult(
         success=success,
         exit_code_match=exit_code_match,
-        message_diffs=diffs,
+        message_diffs=diffs + stderr_diffs,
         summary=summary,
     )
