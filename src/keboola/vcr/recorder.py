@@ -495,27 +495,19 @@ class VCRRecorder:
         Replay recorded HTTP interactions.
 
         This will:
-        1. Check that a cassette exists
-        2. Freeze time to the configured timestamp
-        3. Run the component while replaying recorded HTTP interactions
-        4. Compare captured logs against cassettes/logs.json
-        5. Compare sync action stdout against cassettes/sync_action_result.json
-        6. Assert exit code matches cassettes/expected_status.json (if present)
+        1. If a cassette exists, freeze time and replay recorded HTTP interactions.
+           If no cassette exists, the component runs against the real network (useful
+           for sync actions that hit a live DB/Docker instance with no HTTP mocking).
+        2. Compare captured logs against cassettes/logs.json (if present)
+        3. Compare sync action stdout against cassettes/sync_action_result.json (if present)
+        4. Assert exit code matches cassettes/expected_status.json (if present)
 
         Args:
             component_runner: Callable that runs the component
 
         Raises:
-            CassetteMissingError: If no cassette exists for replay
             RuntimeError: If exit code does not match expected_status.json
         """
-        if not self.has_cassette():
-            raise CassetteMissingError(
-                f"No cassette found at {self.cassette_path}. Run with --record flag to create one."
-            )
-
-        logger.info(f"Replaying HTTP interactions from {self.cassette_path}")
-
         self.last_log_comparison = None
         self.last_sync_action_comparison = None
 
@@ -524,10 +516,15 @@ class VCRRecorder:
 
         effective_freeze_time = self._resolve_freeze_time()
 
-        vcr_context = self._vcr.use_cassette(
-            str(self.cassette_path),
-            record_mode="none",
-        )
+        if self.has_cassette():
+            logger.info(f"Replaying HTTP interactions from {self.cassette_path}")
+            vcr_context: Any = self._vcr.use_cassette(
+                str(self.cassette_path),
+                record_mode="none",
+            )
+        else:
+            logger.info("No cassette found — running without HTTP replay (log/sync-action capture only)")
+            vcr_context = contextlib.nullcontext()
 
         def _run_in_vcr():
             self._is_replaying = True
