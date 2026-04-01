@@ -216,7 +216,14 @@ def run_with_log_capture(
                 warnings.showwarning = lambda *_a, **_kw: None
                 fn()
     except SystemExit as e:
-        exit_code = e.code if isinstance(e.code, int) else None
+        if e.code is None:
+            exit_code = None  # sys.exit() / sys.exit(None) — clean exit, treated as 0
+        elif isinstance(e.code, int):
+            exit_code = e.code
+        else:
+            # sys.exit("message") — Python prints the message to stderr and exits 1
+            stderr_buf.write(str(e.code) + "\n")
+            exit_code = 1
     finally:
         root_logger.removeHandler(handler)
         root_logger.setLevel(previous_level)
