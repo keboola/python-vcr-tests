@@ -14,6 +14,8 @@ import io
 import json
 import logging
 import re
+import sys
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -199,9 +201,17 @@ def run_with_log_capture(
     root_logger.addHandler(handler)
     exit_code: int | None = None
     stderr_buf = io.StringIO()
+
+    def _showwarning_to_stderr(msg, cat, fname, lno, file=None, line=None):
+        """Write warnings to the current sys.stderr (may be redirected to stderr_buf)."""
+        sys.stderr.write(warnings.formatwarning(str(msg), cat, fname, lno, line))
+
     try:
         with contextlib.redirect_stderr(stderr_buf):
-            fn()
+            with warnings.catch_warnings():
+                warnings.simplefilter("always")
+                warnings.showwarning = _showwarning_to_stderr
+                fn()
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else None
     finally:
