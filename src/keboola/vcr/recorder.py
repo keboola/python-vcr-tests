@@ -359,6 +359,7 @@ class VCRRecorder:
         recorder = cls(
             cassette_dir=output_dir,
             sanitizers=chain,
+            secrets=secrets,
             record_mode="all",
             freeze_time_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             cassette_file=f"vcr_debug_{component_id}_{config_id}_{timestamp}.json",
