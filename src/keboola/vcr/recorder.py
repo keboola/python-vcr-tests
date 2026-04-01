@@ -124,6 +124,7 @@ from .log_capture import (
     ComponentRunResult,
     LogComparisonResult,
     LogSanitizer,
+    SyncActionComparisonResult,
     compare_logs,
     load_logs,
     run_with_log_capture,
@@ -241,7 +242,7 @@ class VCRRecorder:
 
         # Set after replay — can be checked by callers (e.g. VCRTestDataDir)
         self.last_log_comparison: LogComparisonResult | None = None
-        self.last_sync_action_comparison: dict | None = None
+        self.last_sync_action_comparison: SyncActionComparisonResult | None = None
 
         # Set up sanitizers — always include DefaultSanitizer so secrets from
         # config.secrets.json are redacted even when component sanitizers are provided.
@@ -640,13 +641,13 @@ class VCRRecorder:
             if not (isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is stdout_capture)
         ]
 
-    def _compare_sync_action_result(self, recorded_raw: str, replayed_raw: str) -> dict:
-        """Compare two sync action stdout JSON strings. Returns dict with success and diff."""
+    def _compare_sync_action_result(self, recorded_raw: str, replayed_raw: str) -> SyncActionComparisonResult:
+        """Compare two sync action stdout JSON strings."""
         try:
             recorded_json = json.loads(recorded_raw) if recorded_raw else None
             replayed_json = json.loads(replayed_raw) if replayed_raw else None
             if recorded_json == replayed_json:
-                return {"success": True, "diff": ""}
+                return SyncActionComparisonResult(success=True, diff="")
             diff = "\n".join(
                 difflib.unified_diff(
                     json.dumps(recorded_json, indent=2).splitlines(),
@@ -656,11 +657,11 @@ class VCRRecorder:
                     lineterm="",
                 )
             )
-            return {"success": False, "diff": diff}
+            return SyncActionComparisonResult(success=False, diff=diff)
         except json.JSONDecodeError:
             success = recorded_raw == replayed_raw
             diff = f"recorded: {recorded_raw!r}\nreplayed: {replayed_raw!r}" if not success else ""
-            return {"success": success, "diff": diff}
+            return SyncActionComparisonResult(success=success, diff=diff)
 
     def _assert_replay_result(
         self,

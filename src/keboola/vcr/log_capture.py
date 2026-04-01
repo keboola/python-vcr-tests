@@ -79,15 +79,20 @@ class ComponentRunResult:
 @dataclass
 class LogComparisonResult:
     success: bool
-    exit_code_match: bool
-    message_diffs: list[str]    # per-entry diff lines from unified_diff
+    diffs: list[str]    # unified_diff lines for log messages and stderr combined
     summary: str
 
     def format_output(self, verbose: bool = False) -> str:
         lines = [self.summary]
-        if self.message_diffs and (verbose or not self.success):
-            lines.extend(self.message_diffs)
+        if self.diffs and (verbose or not self.success):
+            lines.extend(self.diffs)
         return "\n".join(lines)
+
+
+@dataclass
+class SyncActionComparisonResult:
+    success: bool
+    diff: str   # unified_diff string, empty when success=True
 
 
 class LogCaptureHandler(logging.Handler):
@@ -246,16 +251,14 @@ def compare_logs(
     """
     Compare recorded vs replayed logs.
 
-    Exit code: exact match required (None treated as 0).
     Log messages: normalize both sides then compare lists with unified_diff.
+    Stderr: normalize and compare as multiline text.
     Timestamps are not compared — they are informational only.
+    Exit code is not compared here; that is the responsibility of the caller
+    (see VCRRecorder._assert_replay_result).
     """
     if normalizers is None:
         normalizers = DEFAULT_NORMALIZERS
-
-    recorded_code = recorded.exit_code if recorded.exit_code is not None else 0
-    replayed_code = replayed.exit_code if replayed.exit_code is not None else 0
-    exit_code_match = recorded_code == replayed_code
 
     def _normalize_messages(logs: list[CapturedLog]) -> list[str]:
         return [normalize_message(log.message, normalizers) for log in logs]
@@ -263,7 +266,7 @@ def compare_logs(
     recorded_messages = _normalize_messages(recorded.logs)
     replayed_messages = _normalize_messages(replayed.logs)
 
-    diffs = list(
+    message_diffs = list(
         difflib.unified_diff(
             recorded_messages,
             replayed_messages,
@@ -286,22 +289,17 @@ def compare_logs(
         )
     ) if not stderr_match else []
 
-    success = exit_code_match and not diffs and stderr_match
+    success = not message_diffs and stderr_match
 
     parts = []
-    if not exit_code_match:
-        parts.append(
-            f"Exit code mismatch: recorded={recorded_code}, replayed={replayed_code}"
-        )
-    if diffs:
-        parts.append(f"Log messages differ ({len(diffs)} diff lines)")
+    if message_diffs:
+        parts.append(f"Log messages differ ({len(message_diffs)} diff lines)")
     if stderr_diffs:
         parts.append(f"Stderr differs ({len(stderr_diffs)} diff lines)")
     summary = "; ".join(parts) if parts else "Logs match"
 
     return LogComparisonResult(
         success=success,
-        exit_code_match=exit_code_match,
-        message_diffs=diffs + stderr_diffs,
+        diffs=message_diffs + stderr_diffs,
         summary=summary,
     )
