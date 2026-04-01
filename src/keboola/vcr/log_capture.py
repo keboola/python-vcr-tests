@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging import LogRecord
 from pathlib import Path
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 DEFAULT_IGNORED_LOGGERS: frozenset[str] = frozenset(
     {"vcr", "urllib3", "freezegun", "datadirtest", "filelock"}
@@ -223,7 +224,7 @@ def save_logs(result: ComponentRunResult, logs_path: Path) -> None:
 
 def load_logs(logs_path: Path) -> ComponentRunResult:
     """Load a ComponentRunResult from a JSON file."""
-    with open(logs_path, "r") as f:
+    with open(logs_path) as f:
         data = json.load(f)
     return ComponentRunResult.from_dict(data)
 
