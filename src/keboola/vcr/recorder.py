@@ -478,6 +478,8 @@ class VCRRecorder:
             raw = stdout_capture.getvalue().strip()
             if raw:
                 self.sync_action_result_path.write_text(raw)
+            else:
+                self.sync_action_result_path.unlink(missing_ok=True)
 
         metadata = {
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -673,19 +675,7 @@ class VCRRecorder:
         expected_status = self._load_expected_status()
         expected_exit = expected_status.get("exit_code", 0) if expected_status else 0
 
-        if actual_exit != expected_exit:
-            if actual_exit != 0:
-                raise RuntimeError(
-                    f"Component exited with unexpected exit code {actual_exit} (expected {expected_exit}). "
-                    f"If this is an intentional failure test, create {self.expected_status_path} "
-                    f"with the expected exit code, or re-record the cassette."
-                )
-            else:
-                raise RuntimeError(
-                    f"Component succeeded (exit code 0) but expected exit code {expected_exit}. "
-                    f"The component behaviour has changed since the cassette was recorded."
-                )
-
+        # Compute comparisons before raising so callers always have full context.
         if run_result is not None and self.logs_path.exists():
             if self.secrets:
                 run_result = LogSanitizer(self.secrets).sanitize(run_result)
@@ -698,6 +688,19 @@ class VCRRecorder:
             self.last_sync_action_comparison = self._compare_sync_action_result(
                 recorded_raw, replayed_raw
             )
+
+        if actual_exit != expected_exit:
+            if actual_exit != 0:
+                raise RuntimeError(
+                    f"Component exited with unexpected exit code {actual_exit} (expected {expected_exit}). "
+                    f"If this is an intentional failure test, create {self.expected_status_path} "
+                    f"with the expected exit code, or re-record the cassette."
+                )
+            else:
+                raise RuntimeError(
+                    f"Component succeeded (exit code 0) but expected exit code {expected_exit}. "
+                    f"The component behaviour has changed since the cassette was recorded."
+                )
 
     def _append_interaction(self, temp_path: Path, cassette_before_record_response, request, response) -> None:
         """Serialize a single recorded interaction to the JSONL temp file."""
