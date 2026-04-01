@@ -14,11 +14,11 @@ import io
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging import LogRecord
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 
 DEFAULT_IGNORED_LOGGERS: frozenset[str] = frozenset(
