@@ -14,7 +14,6 @@ import io
 import json
 import logging
 import re
-import sys
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -201,16 +200,15 @@ def run_with_log_capture(
     root_logger.addHandler(handler)
     exit_code: int | None = None
     stderr_buf = io.StringIO()
-
-    def _showwarning_to_stderr(msg, cat, fname, lno, file=None, line=None):
-        """Write warnings to the current sys.stderr (may be redirected to stderr_buf)."""
-        sys.stderr.write(warnings.formatwarning(str(msg), cat, fname, lno, line))
-
     try:
         with contextlib.redirect_stderr(stderr_buf):
             with warnings.catch_warnings():
-                warnings.simplefilter("always")
-                warnings.showwarning = _showwarning_to_stderr
+                # Prevent Python's warnings.warn() output from reaching stderr.
+                # These are library-level notices (deprecations, tz mismatches, etc.)
+                # that vary between a fresh-process recording and an in-process replay
+                # (due to per-module __warningregistry__ dedup), causing false diffs.
+                # Real component stderr output (sys.stderr.write / print) is still captured.
+                warnings.showwarning = lambda *_a, **_kw: None
                 fn()
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else None
