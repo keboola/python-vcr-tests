@@ -610,6 +610,8 @@ class VCRRecorder:
             if actual_exit != 0:
                 expected_status = {"exit_code": actual_exit}
                 self.expected_status_path.write_text(json.dumps(expected_status, indent=2))
+            else:
+                self.expected_status_path.unlink(missing_ok=True)
 
     def _load_expected_status(self) -> dict | None:
         """Load expected_status.json if it exists."""
@@ -685,6 +687,8 @@ class VCRRecorder:
                 )
 
         if run_result is not None and self.logs_path.exists():
+            if self.secrets:
+                run_result = LogSanitizer(self.secrets).sanitize(run_result)
             recorded = load_logs(self.logs_path)
             self.last_log_comparison = compare_logs(recorded, run_result, self.log_normalizers)
 
