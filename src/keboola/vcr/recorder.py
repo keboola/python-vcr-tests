@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import difflib
 import functools
+import io
 import json
 import logging
 import os
@@ -118,6 +120,16 @@ try:
 except ImportError:
     freeze_time = None  # type: ignore
 
+from .log_capture import (
+    ComponentRunResult,
+    LogComparisonResult,
+    LogSanitizer,
+    SyncActionComparisonResult,
+    compare_logs,
+    load_logs,
+    run_with_log_capture,
+    save_logs,
+)
 from .sanitizers import (
     BaseSanitizer,
     CompositeSanitizer,
@@ -180,6 +192,9 @@ class VCRRecorder:
         match_on: list[str] | None = None,
         cassette_file: str = DEFAULT_CASSETTE_FILE,
         decode_compressed_response: bool = True,
+        capture_logs: bool = True,
+        log_normalizers: list[tuple[str, str]] | None = None,
+        ignored_loggers: set[str] | None = None,
     ):
         """
         Initialize VCR recorder.
@@ -199,6 +214,12 @@ class VCRRecorder:
                 readable text and avoids replay failures with libraries that parse raw
                 response bodies (e.g. Zeep/SOAP WSDL parsing). Disable for APIs that
                 return intentionally compressed binary payloads.
+            capture_logs: Capture Python logging output during record/replay (default: True).
+                         Logs are saved to cassettes/logs.json and compared on replay.
+            log_normalizers: Regex replacement pairs applied to log messages before comparison.
+                            Defaults to normalizing UUIDs and epoch timestamps.
+            ignored_loggers: Logger name prefixes to exclude from capture.
+                            Defaults to vcr, urllib3, freezegun, datadirtest, filelock.
         """
         self._check_dependencies()
 
@@ -210,6 +231,18 @@ class VCRRecorder:
         self.freeze_time_at = freeze_time_at
         self.record_mode = record_mode
         self.match_on = match_on or ["method", "scheme", "host", "port", "path", "query"]
+        self.capture_logs = capture_logs
+        self.log_normalizers = log_normalizers
+        self.ignored_loggers = ignored_loggers
+
+        # Paths for artefacts stored alongside the cassette
+        self.logs_path = self.cassette_dir / "logs.json"
+        self.sync_action_result_path = self.cassette_dir / "sync_action_result.json"
+        self.expected_status_path = self.cassette_dir / "expected_status.json"
+
+        # Set after replay — can be checked by callers (e.g. VCRTestDataDir)
+        self.last_log_comparison: LogComparisonResult | None = None
+        self.last_sync_action_comparison: SyncActionComparisonResult | None = None
 
         # Set up sanitizers — always include DefaultSanitizer so secrets from
         # config.secrets.json are redacted even when component sanitizers are provided.
@@ -326,6 +359,7 @@ class VCRRecorder:
         recorder = cls(
             cassette_dir=output_dir,
             sanitizers=chain,
+            secrets=secrets,
             record_mode="all",
             freeze_time_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             cassette_file=f"vcr_debug_{component_id}_{config_id}_{timestamp}.json",
@@ -345,12 +379,12 @@ class VCRRecorder:
             component_runner: Callable that runs the component
             mode: One of:
                 - 'record': Always record (requires credentials)
-                - 'replay': Always replay (fails if no cassette)
+                - 'replay': Always replay. If no cassette exists, runs against
+                  the live network (useful for sync actions with no HTTP mocking).
                 - 'auto': Replay if cassette exists, otherwise record
 
         Raises:
             ValueError: If mode is invalid
-            CassetteMissingError: If mode is 'replay' and no cassette exists
         """
         if mode == "record":
             self.record(component_runner)
@@ -373,11 +407,19 @@ class VCRRecorder:
         buffer. This keeps memory usage constant regardless of job size.
         The final cassette JSON is reconstructed from the temp file at the end.
 
+        Also captures Python logging output (saved to cassettes/logs.json),
+        sync action stdout output (saved to cassettes/sync_action_result.json),
+        and auto-saves cassettes/expected_status.json when the component exits
+        with a non-zero code.
+
         Args:
             component_runner: Callable that runs the component
         """
         self.cassette_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Recording HTTP interactions to {self.cassette_path}")
+
+        action = self._get_action_name()
+        stdout_capture = io.StringIO() if action != "run" else None
 
         temp_path = self.cassette_path.with_suffix(".jsonl.tmp")
         temp_path.unlink(missing_ok=True)
@@ -399,7 +441,7 @@ class VCRRecorder:
 
         vcr_context = self._vcr.use_cassette(str(self.cassette_path), record_mode="all")
 
-        try:
+        def _run_in_vcr():
             with vcr_context as cassette:
                 # Capture the cassette's full filter chain so that vcrpy's built-in
                 # decode_compressed_response hook (and our sanitizer) both run inside
@@ -413,13 +455,35 @@ class VCRRecorder:
                 cassette._save = lambda force=False: None
 
                 with _pool_reuse_patch():
-                    if self.freeze_time_at and self.freeze_time_at != "auto":
-                        with freeze_time(self.freeze_time_at):
-                            component_runner()
+                    if stdout_capture is not None:
+                        with contextlib.redirect_stdout(stdout_capture):
+                            self._run_with_freeze(component_runner)
                     else:
-                        component_runner()
+                        self._run_with_freeze(component_runner)
+
+        run_result: ComponentRunResult | None = None
+        try:
+            if self.capture_logs:
+                run_result = run_with_log_capture(_run_in_vcr, self.ignored_loggers)
+            else:
+                _run_in_vcr()
         finally:
             _VCRHTTPResponse.__init__ = _original_vcr_init
+
+        if stdout_capture is not None:
+            self._remove_leaked_stdout_handlers(stdout_capture)
+
+        if run_result is not None:
+            self._save_log_artefacts(run_result, is_recording=True)
+
+        if stdout_capture is not None:
+            raw = stdout_capture.getvalue().strip()
+            if self.secrets:
+                raw = LogSanitizer(self.secrets).sanitize_string(raw)
+            if raw:
+                self.sync_action_result_path.write_text(raw)
+            else:
+                self.sync_action_result_path.unlink(missing_ok=True)
 
         metadata = {
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -437,41 +501,62 @@ class VCRRecorder:
         Replay recorded HTTP interactions.
 
         This will:
-        1. Check that a cassette exists
-        2. Freeze time to the configured timestamp
-        3. Run the component while replaying recorded HTTP interactions
+        1. If a cassette exists, freeze time and replay recorded HTTP interactions.
+           If no cassette exists, the component runs against the real network (useful
+           for sync actions that hit a live DB/Docker instance with no HTTP mocking).
+        2. Compare captured logs against cassettes/logs.json (if present)
+        3. Compare sync action stdout against cassettes/sync_action_result.json (if present)
+        4. Assert exit code matches cassettes/expected_status.json (if present)
 
         Args:
             component_runner: Callable that runs the component
 
         Raises:
-            CassetteMissingError: If no cassette exists for replay
+            RuntimeError: If exit code does not match expected_status.json
         """
-        if not self.has_cassette():
-            raise CassetteMissingError(
-                f"No cassette found at {self.cassette_path}. Run with --record flag to create one."
+        self.last_log_comparison = None
+        self.last_sync_action_comparison = None
+
+        action = self._get_action_name()
+        stdout_capture = io.StringIO() if action != "run" else None
+
+        if self.has_cassette():
+            logger.info(f"Replaying HTTP interactions from {self.cassette_path}")
+            vcr_context: Any = self._vcr.use_cassette(
+                str(self.cassette_path),
+                record_mode="none",
             )
+            effective_freeze_time = self._resolve_freeze_time()
+        else:
+            logger.info("No cassette found — running without HTTP replay (log/sync-action capture only)")
+            vcr_context = contextlib.nullcontext()
+            # No cassette metadata to read from — honour an explicit freeze time but
+            # don't fall back to DEFAULT_FREEZE_TIME for live-network runs.
+            ft = self.freeze_time_at
+            effective_freeze_time = ft if ft and ft != "auto" else None
 
-        logger.info(f"Replaying HTTP interactions from {self.cassette_path}")
-
-        effective_freeze_time = self._resolve_freeze_time()
-
-        vcr_context = self._vcr.use_cassette(
-            str(self.cassette_path),
-            record_mode="none",
-        )
-
-        self._is_replaying = True
-        try:
-            if effective_freeze_time:
-                with freeze_time(effective_freeze_time):
-                    with vcr_context:
-                        component_runner()
-            else:
+        def _run_in_vcr():
+            self._is_replaying = True
+            try:
                 with vcr_context:
-                    component_runner()
-        finally:
-            self._is_replaying = False
+                    if stdout_capture is not None:
+                        with contextlib.redirect_stdout(stdout_capture):
+                            self._run_with_freeze(component_runner, effective_freeze_time)
+                    else:
+                        self._run_with_freeze(component_runner, effective_freeze_time)
+            finally:
+                self._is_replaying = False
+
+        run_result: ComponentRunResult | None = None
+        if self.capture_logs:
+            run_result = run_with_log_capture(_run_in_vcr, self.ignored_loggers)
+        else:
+            _run_in_vcr()
+
+        if stdout_capture is not None:
+            self._remove_leaked_stdout_handlers(stdout_capture)
+
+        self._assert_replay_result(run_result, stdout_capture)
 
         logger.info("Replay completed successfully")
 
@@ -501,6 +586,130 @@ class VCRRecorder:
         with open(cassette_path) as f:
             data = json.load(f)
         return data.get("_metadata", {})
+
+    def _get_action_name(self) -> str:
+        """Read the 'action' field from config.json adjacent to cassette_dir."""
+        config_path = self.cassette_dir.parent / "config.json"
+        if not config_path.exists():
+            return "run"
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            return config.get("action", "run") or "run"
+        except Exception:
+            return "run"
+
+    def _run_with_freeze(self, runner: Callable[[], None], freeze_time_val: str | None = None) -> None:
+        """Run runner inside optional freeze_time context."""
+        ft = freeze_time_val if freeze_time_val is not None else self.freeze_time_at
+        if ft and ft != "auto":
+            with freeze_time(ft):
+                runner()
+        else:
+            runner()
+
+    def _save_log_artefacts(self, run_result: ComponentRunResult, is_recording: bool) -> None:
+        """Sanitize and persist logs.json; auto-save expected_status.json on recording failure."""
+        if self.secrets:
+            run_result = LogSanitizer(self.secrets).sanitize(run_result)
+        save_logs(run_result, self.logs_path)
+
+        if is_recording:
+            actual_exit = run_result.exit_code if run_result.exit_code is not None else 0
+            if actual_exit != 0:
+                expected_status = {"exit_code": actual_exit}
+                self.expected_status_path.write_text(json.dumps(expected_status, indent=2))
+            else:
+                self.expected_status_path.unlink(missing_ok=True)
+
+    def _load_expected_status(self) -> dict | None:
+        """Load expected_status.json if it exists."""
+        if self.expected_status_path.exists():
+            try:
+                return json.loads(self.expected_status_path.read_text())
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _remove_leaked_stdout_handlers(stdout_capture: io.StringIO) -> None:
+        """Remove any StreamHandlers pointing to stdout_capture from the root logger.
+
+        keboola.component's CommonInterface.__init__ adds StreamHandler(sys.stdout) to
+        the root logger. When the component runs inside redirect_stdout(stdout_capture),
+        that handler captures stdout_capture. It persists after the component returns,
+        causing subsequent logger calls (e.g. "Replay completed successfully") to write
+        into stdout_capture and contaminate the sync action JSON output.
+        """
+        root = logging.getLogger()
+        root.handlers = [
+            h for h in root.handlers
+            if not (isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is stdout_capture)
+        ]
+
+    def _compare_sync_action_result(self, recorded_raw: str, replayed_raw: str) -> SyncActionComparisonResult:
+        """Compare two sync action stdout JSON strings."""
+        try:
+            recorded_json = json.loads(recorded_raw) if recorded_raw else None
+            replayed_json = json.loads(replayed_raw) if replayed_raw else None
+            if recorded_json == replayed_json:
+                return SyncActionComparisonResult(success=True, diff="")
+            diff = "\n".join(
+                difflib.unified_diff(
+                    json.dumps(recorded_json, indent=2).splitlines(),
+                    json.dumps(replayed_json, indent=2).splitlines(),
+                    fromfile="recorded",
+                    tofile="replayed",
+                    lineterm="",
+                )
+            )
+            return SyncActionComparisonResult(success=False, diff=diff)
+        except json.JSONDecodeError:
+            success = recorded_raw == replayed_raw
+            diff = f"recorded: {recorded_raw!r}\nreplayed: {replayed_raw!r}" if not success else ""
+            return SyncActionComparisonResult(success=success, diff=diff)
+
+    def _assert_replay_result(
+        self,
+        run_result: ComponentRunResult | None,
+        stdout_capture: io.StringIO | None,
+    ) -> None:
+        """Check exit code, compare logs and sync action output after replay."""
+        actual_exit = 0
+        if run_result is not None:
+            actual_exit = run_result.exit_code if run_result.exit_code is not None else 0
+
+        expected_status = self._load_expected_status()
+        expected_exit = expected_status.get("exit_code", 0) if expected_status else 0
+
+        # Compute comparisons before raising so callers always have full context.
+        if run_result is not None and self.logs_path.exists():
+            if self.secrets:
+                run_result = LogSanitizer(self.secrets).sanitize(run_result)
+            recorded = load_logs(self.logs_path)
+            self.last_log_comparison = compare_logs(recorded, run_result, self.log_normalizers)
+
+        if stdout_capture is not None and self.sync_action_result_path.exists():
+            recorded_raw = self.sync_action_result_path.read_text().strip()
+            replayed_raw = stdout_capture.getvalue().strip()
+            if self.secrets:
+                replayed_raw = LogSanitizer(self.secrets).sanitize_string(replayed_raw)
+            self.last_sync_action_comparison = self._compare_sync_action_result(
+                recorded_raw, replayed_raw
+            )
+
+        if actual_exit != expected_exit:
+            if actual_exit != 0:
+                raise RuntimeError(
+                    f"Component exited with unexpected exit code {actual_exit} (expected {expected_exit}). "
+                    f"If this is an intentional failure test, create {self.expected_status_path} "
+                    f"with the expected exit code, or re-record the cassette."
+                )
+            else:
+                raise RuntimeError(
+                    f"Component succeeded (exit code 0) but expected exit code {expected_exit}. "
+                    f"The component behaviour has changed since the cassette was recorded."
+                )
 
     def _append_interaction(self, temp_path: Path, cassette_before_record_response, request, response) -> None:
         """Serialize a single recorded interaction to the JSONL temp file."""
@@ -538,8 +747,11 @@ class VCRRecorder:
             logger.warning("No metadata in cassette, falling back to default freeze time")
             return self.DEFAULT_FREEZE_TIME
 
-        # Prefer freeze_time (the value used during recording), fall back to recorded_at
-        resolved = metadata.get("freeze_time") or metadata.get("recorded_at", self.DEFAULT_FREEZE_TIME)
+        # Prefer freeze_time (the value used during recording), fall back to recorded_at.
+        # Treat the literal "auto" as unresolved — it means auto-mode was active during
+        # recording and the actual freeze time should come from recorded_at.
+        ft = metadata.get("freeze_time")
+        resolved = ft if (ft and ft != "auto") else metadata.get("recorded_at", self.DEFAULT_FREEZE_TIME)
         logger.info(f"Auto-resolved freeze_time from cassette metadata: {resolved}")
         return resolved
 
