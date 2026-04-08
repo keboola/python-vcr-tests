@@ -29,6 +29,9 @@ DEFAULT_LOG_LEVEL = logging.DEBUG
 
 DEFAULT_NORMALIZERS: list[tuple[str, str]] = [
     (r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<UUID>"),
+    # Unix epoch timestamps: 10 digits (seconds) to 13 digits (milliseconds).
+    # ISO datetimes are not normalized here — they rarely appear in log messages
+    # and would need format-aware parsing to avoid false positives.
     (r"\b\d{10,13}\b", "<EPOCH>"),
 ]
 

@@ -379,12 +379,12 @@ class VCRRecorder:
             component_runner: Callable that runs the component
             mode: One of:
                 - 'record': Always record (requires credentials)
-                - 'replay': Always replay (fails if no cassette)
+                - 'replay': Always replay. If no cassette exists, runs against
+                  the live network (useful for sync actions with no HTTP mocking).
                 - 'auto': Replay if cassette exists, otherwise record
 
         Raises:
             ValueError: If mode is invalid
-            CassetteMissingError: If mode is 'replay' and no cassette exists
         """
         if mode == "record":
             self.record(component_runner)
