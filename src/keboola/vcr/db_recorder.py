@@ -143,10 +143,7 @@ class _StreamingDBLog:
             return rows
         sanitized = []
         for row in rows:
-            sanitized.append([
-                "[REDACTED]" if isinstance(v, str) and v in self._secret_values else v
-                for v in row
-            ])
+            sanitized.append(["[REDACTED]" if isinstance(v, str) and v in self._secret_values else v for v in row])
         return sanitized
 
     def append(self, entry: dict) -> None:

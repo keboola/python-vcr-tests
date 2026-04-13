@@ -61,7 +61,7 @@ from pathlib import Path
 from runpy import run_path
 from typing import Any
 
-from .db_recorder import DBAdapter, DBVCRRecorder, OracleDBAdapter
+from .db_recorder import DBAdapter, OracleDBAdapter
 from .recorder import VCRRecorder
 from .validator import save_output_snapshot
 

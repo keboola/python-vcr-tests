@@ -694,7 +694,8 @@ class VCRRecorder:
         """
         root = logging.getLogger()
         root.handlers = [
-            h for h in root.handlers
+            h
+            for h in root.handlers
             if not (isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is stdout_capture)
         ]
 
@@ -745,9 +746,7 @@ class VCRRecorder:
             replayed_raw = stdout_capture.getvalue().strip()
             if self.secrets:
                 replayed_raw = LogSanitizer(self.secrets).sanitize_string(replayed_raw)
-            self.last_sync_action_comparison = self._compare_sync_action_result(
-                recorded_raw, replayed_raw
-            )
+            self.last_sync_action_comparison = self._compare_sync_action_result(recorded_raw, replayed_raw)
 
         if actual_exit != expected_exit:
             if actual_exit != 0:
@@ -806,9 +805,7 @@ class VCRRecorder:
         logger.info(f"Auto-resolved freeze_time from cassette metadata: {resolved}")
         return resolved
 
-    def _write_cassette(
-        self, temp_path: Path, metadata: dict, db_temp_path: Path | None = None
-    ) -> None:
+    def _write_cassette(self, temp_path: Path, metadata: dict, db_temp_path: Path | None = None) -> None:
         """Stream-write the cassette JSON from JSONL temp files.
 
         Both HTTP interactions (from *temp_path*) and DB interactions (from

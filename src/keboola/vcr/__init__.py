@@ -12,6 +12,11 @@ Usage:
     from keboola.vcr.sanitizers import ConfigSecretsSanitizer
 """
 
+from .db_recorder import (
+    DBAdapter,
+    DBVCRRecorder,
+    OracleDBAdapter,
+)
 from .log_capture import (
     CapturedLog,
     ComponentRunResult,
@@ -44,11 +49,6 @@ from .sanitizers import (
     UrlPatternSanitizer,
     create_default_sanitizer,
     extract_values,
-)
-from .db_recorder import (
-    DBAdapter,
-    DBVCRRecorder,
-    OracleDBAdapter,
 )
 from .scaffolder import (
     ScaffolderError,

@@ -40,17 +40,17 @@ DEFAULT_NORMALIZERS: list[tuple[str, str]] = [
 
 @dataclass
 class CapturedLog:
-    level: str          # "INFO", "ERROR", etc.
-    logger_name: str    # e.g. "src.component"
-    message: str        # formatted log message (exc_text appended if present)
-    timestamp: str      # ISO8601 UTC timestamp, e.g. "2025-01-01T12:00:01.234Z"
+    level: str  # "INFO", "ERROR", etc.
+    logger_name: str  # e.g. "src.component"
+    message: str  # formatted log message (exc_text appended if present)
+    timestamp: str  # ISO8601 UTC timestamp, e.g. "2025-01-01T12:00:01.234Z"
 
 
 @dataclass
 class ComponentRunResult:
-    exit_code: int | None   # None = clean exit (treated as 0), 1 = UserException, 2 = AppError
+    exit_code: int | None  # None = clean exit (treated as 0), 1 = UserException, 2 = AppError
     logs: list[CapturedLog] = field(default_factory=list)
-    stderr: str = ""        # raw stderr output (e.g. sync action error messages, tracebacks)
+    stderr: str = ""  # raw stderr output (e.g. sync action error messages, tracebacks)
 
     def to_dict(self) -> dict:
         return {
@@ -84,7 +84,7 @@ class ComponentRunResult:
 @dataclass
 class LogComparisonResult:
     success: bool
-    diffs: list[str]    # unified_diff lines for log messages and stderr combined
+    diffs: list[str]  # unified_diff lines for log messages and stderr combined
     summary: str
 
     def format_output(self, verbose: bool = False) -> str:
@@ -97,7 +97,7 @@ class LogComparisonResult:
 @dataclass
 class SyncActionComparisonResult:
     success: bool
-    diff: str   # unified_diff string, empty when success=True
+    diff: str  # unified_diff string, empty when success=True
 
 
 class LogCaptureHandler(logging.Handler):
@@ -128,9 +128,9 @@ class LogCaptureHandler(logging.Handler):
                 record.exc_text = self._formatter.formatException(record.exc_info)
             if record.exc_text:
                 message = f"{message}\n{record.exc_text}"
-            timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%S.%f"
-            )[:-3] + "Z"
+            timestamp = (
+                datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            )
             self._records.append(
                 CapturedLog(
                     level=record.levelname,
@@ -159,9 +159,7 @@ class LogSanitizer:
     def __init__(self, secrets: dict[str, Any]) -> None:
         from keboola.vcr.sanitizers import extract_values
 
-        self._secret_values = sorted(
-            [str(v) for v in extract_values(secrets) if v], key=len, reverse=True
-        )
+        self._secret_values = sorted([str(v) for v in extract_values(secrets) if v], key=len, reverse=True)
 
     def sanitize_string(self, text: str) -> str:
         """Replace secret values in an arbitrary string."""
@@ -332,15 +330,19 @@ def compare_logs(
     recorded_stderr = normalize_message(recorded.stderr, normalizers)
     replayed_stderr = normalize_message(replayed.stderr, normalizers)
     stderr_match = recorded_stderr == replayed_stderr
-    stderr_diffs = list(
-        difflib.unified_diff(
-            recorded_stderr.splitlines(),
-            replayed_stderr.splitlines(),
-            fromfile="recorded stderr",
-            tofile="replayed stderr",
-            lineterm="",
+    stderr_diffs = (
+        list(
+            difflib.unified_diff(
+                recorded_stderr.splitlines(),
+                replayed_stderr.splitlines(),
+                fromfile="recorded stderr",
+                tofile="replayed stderr",
+                lineterm="",
+            )
         )
-    ) if not stderr_match else []
+        if not stderr_match
+        else []
+    )
 
     success = not message_diffs and stderr_match
 
