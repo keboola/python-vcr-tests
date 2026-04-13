@@ -14,7 +14,6 @@ Usage:
 
 from .db_recorder import (
     DBAdapter,
-    DBVCRRecorder,
     OracleDBAdapter,
 )
 from .log_capture import (
@@ -105,7 +104,6 @@ __all__ = [
     "save_output_snapshot",
     "validate_output_snapshot",
     # DB VCR
-    "DBVCRRecorder",
     "DBAdapter",
     "OracleDBAdapter",
     # Scaffolder

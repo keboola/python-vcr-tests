@@ -511,7 +511,7 @@ class VCRRecorder:
         # Add DB adapter metadata
         if self.db_adapters:
             metadata["db_driver"] = self.db_adapters[0].driver_name
-            metadata["keboola_db_vcr_version"] = "0.1.0"
+            metadata["keboola_db_vcr_version"] = self._get_version()
 
         try:
             self._write_cassette(temp_path, metadata, db_temp_path=db_temp_path)

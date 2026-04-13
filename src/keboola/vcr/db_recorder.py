@@ -20,16 +20,12 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
-# Default cassette file — same as HTTP VCR so both live in one file.
-DEFAULT_CASSETTE_FILE = "requests.json"
 
 
 # ── JSON serialization helpers ───────────────────────────────────
@@ -120,30 +116,31 @@ class _StreamingDBLog:
         self._path = temp_path
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._count = 0
-        # Flatten nested secret values into a set of strings to redact
-        self._secret_values: set[str] = set()
+        # Use the same extract_values logic as LogSanitizer — sorted longest-first
+        # so longer secrets are replaced before shorter ones that may be substrings.
+        self._secret_values: list[str] = []
         if secrets:
-            self._collect_secret_values(secrets, self._secret_values)
+            from keboola.vcr.sanitizers import extract_values
 
-    @staticmethod
-    def _collect_secret_values(obj: Any, values: set[str]) -> None:
-        """Recursively collect all string values from a nested dict/list."""
-        if isinstance(obj, str) and len(obj) > 2:
-            values.add(obj)
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                _StreamingDBLog._collect_secret_values(v, values)
-        elif isinstance(obj, list):
-            for v in obj:
-                _StreamingDBLog._collect_secret_values(v, values)
+            self._secret_values = sorted(
+                [str(v) for v in extract_values(secrets) if v],
+                key=len,
+                reverse=True,
+            )
 
     def _sanitize_rows(self, rows: list[list]) -> list[list]:
-        """Replace secret values in row data with [REDACTED]."""
+        """Replace secret values (substring match) in row data with [REDACTED]."""
         if not self._secret_values:
             return rows
         sanitized = []
         for row in rows:
-            sanitized.append(["[REDACTED]" if isinstance(v, str) and v in self._secret_values else v for v in row])
+            sanitized_row = []
+            for v in row:
+                if isinstance(v, str):
+                    for secret in self._secret_values:
+                        v = v.replace(secret, "[REDACTED]")
+                sanitized_row.append(v)
+            sanitized.append(sanitized_row)
         return sanitized
 
     def append(self, entry: dict) -> None:
@@ -195,7 +192,8 @@ class DBAdapter(ABC):
 class OracleDBAdapter(DBAdapter):
     """Adapter for the ``oracledb`` Python driver (thin mode)."""
 
-    _original_connect: Any = None
+    def __init__(self) -> None:
+        self._original_connect: Any = None
 
     @property
     def driver_name(self) -> str:
@@ -206,8 +204,8 @@ class OracleDBAdapter(DBAdapter):
 
         self._original_connect = oracledb.connect
 
-        def recording_connect(**kwargs: Any) -> Any:
-            real_conn = self._original_connect(**kwargs)
+        def recording_connect(*args: Any, **kwargs: Any) -> Any:
+            real_conn = self._original_connect(*args, **kwargs)
             return _RecordingConnection(real_conn, interaction_log)
 
         oracledb.connect = recording_connect
@@ -216,9 +214,9 @@ class OracleDBAdapter(DBAdapter):
         import oracledb
 
         self._original_connect = oracledb.connect
-        replay_store = _ReplayStore(interactions)
+        replay_store = _ReplayStore(interactions, error_class=oracledb.DatabaseError)
 
-        def replaying_connect(**kwargs: Any) -> Any:
+        def replaying_connect(*args: Any, **kwargs: Any) -> Any:
             return _ReplayConnection(replay_store)
 
         oracledb.connect = replaying_connect
@@ -321,6 +319,11 @@ class _RecordingCursor:
             self._current_entry = None
         self._cursor.close()
 
+    def __del__(self) -> None:
+        if self._current_entry is not None:
+            self._log.append(self._current_entry)
+            self._current_entry = None
+
     def __enter__(self) -> _RecordingCursor:
         return self
 
@@ -334,9 +337,10 @@ class _RecordingCursor:
 class _ReplayStore:
     """Lookup store for replaying DB interactions from cassette."""
 
-    def __init__(self, interactions: list[dict]) -> None:
+    def __init__(self, interactions: list[dict], error_class: type[Exception] = RuntimeError) -> None:
         self._entries = interactions
         self._used: list[bool] = [False] * len(interactions)
+        self.error_class = error_class
 
     def lookup(self, sql: str, params: Any) -> dict:
         """Find a matching interaction by normalized SQL + params hash."""
@@ -397,12 +401,7 @@ class _ReplayCursor:
         # Replay recorded errors — raise the original driver exception type
         # so the component's error handling catches it correctly.
         if "error" in entry:
-            try:
-                import oracledb
-
-                raise oracledb.DatabaseError(entry["error"])
-            except ImportError:
-                raise Exception(entry["error"])
+            raise self._store.error_class(entry["error"])
         self._description = _expand_description(entry.get("description"))
         self._rows = entry.get("rows", [])
         self._offset = 0
@@ -435,148 +434,11 @@ class _ReplayCursor:
         pass
 
 
-# ── DBVCRRecorder ────────────────────────────────────────────────
+def _get_version() -> str:
+    """Get keboola.vcr package version."""
+    try:
+        from importlib.metadata import version
 
-
-class DBVCRRecorder:
-    """Record and replay database interactions.
-
-    Designed to work alongside ``VCRRecorder`` for HTTP interactions.
-    DB interactions are stored in the shared ``requests.json`` cassette
-    under the ``db_interactions`` key.
-
-    When recording, the DB interactions are merged into the existing
-    cassette file (preserving HTTP interactions). When replaying,
-    only the ``db_interactions`` key is read.
-    """
-
-    def __init__(
-        self,
-        cassette_dir: Path,
-        adapter: DBAdapter,
-        cassette_file: str = DEFAULT_CASSETTE_FILE,
-    ) -> None:
-        self.cassette_dir = cassette_dir
-        self.cassette_path = cassette_dir / cassette_file
-        self.adapter = adapter
-
-    @classmethod
-    def from_test_dir(cls, test_data_dir: Path, adapter: DBAdapter) -> DBVCRRecorder:
-        """Create recorder from a datadirtest source/data directory."""
-        cassette_dir = test_data_dir / "cassettes"
-        return cls(cassette_dir=cassette_dir, adapter=adapter)
-
-    def has_cassette(self) -> bool:
-        """Check if cassette file exists and contains db_interactions."""
-        if not self.cassette_path.exists():
-            return False
-        try:
-            with open(self.cassette_path) as f:
-                data = json.load(f)
-            return bool(data.get("db_interactions"))
-        except (json.JSONDecodeError, OSError):
-            return False
-
-    @contextmanager
-    def recording_context(self):
-        """Context manager that patches the DB driver for recording.
-
-        Yields the interaction log list which will be populated during recording.
-        """
-        interaction_log: list[dict] = []
-        self.adapter.patch_for_record(interaction_log)
-        try:
-            yield interaction_log
-        finally:
-            self.adapter.unpatch()
-
-    @contextmanager
-    def replay_context(self):
-        """Context manager that patches the DB driver for replay."""
-        interactions = self._load_db_interactions()
-        self.adapter.patch_for_replay(interactions)
-        try:
-            yield
-        finally:
-            self.adapter.unpatch()
-
-    def record(self, component_runner: callable) -> None:
-        """Record DB interactions while running the component.
-
-        The interactions are held in memory until ``flush()`` is called.
-        This allows the HTTP VCR recorder to write ``requests.json`` first,
-        after which ``flush()`` merges ``db_interactions`` into the same file
-        without being overwritten.
-        """
-        self.cassette_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("Recording DB interactions to %s", self.cassette_path)
-
-        with self.recording_context() as interaction_log:
-            component_runner()
-
-        self._pending_interactions = interaction_log
-        logger.info("Captured %d DB interactions (pending flush)", len(interaction_log))
-
-    def flush(self) -> None:
-        """Merge pending DB interactions into the cassette file.
-
-        Call this AFTER the HTTP VCR recorder has written ``requests.json``
-        so that ``db_interactions`` are added without being overwritten.
-        """
-        if not hasattr(self, "_pending_interactions") or not self._pending_interactions:
-            return
-        self._merge_into_cassette(self._pending_interactions)
-        logger.info("Flushed %d DB interactions to %s", len(self._pending_interactions), self.cassette_path)
-        self._pending_interactions = []
-
-    def replay(self, component_runner: callable) -> None:
-        """Replay DB interactions from cassette."""
-        if not self.has_cassette():
-            logger.info("No DB cassette found — running without DB replay")
-            component_runner()
-            return
-
-        logger.info("Replaying DB interactions from %s", self.cassette_path)
-        with self.replay_context():
-            component_runner()
-        logger.info("DB replay completed successfully")
-
-    def _merge_into_cassette(self, interactions: list[dict]) -> None:
-        """Merge DB interactions into the shared cassette file.
-
-        If the cassette already exists (e.g. HTTP interactions recorded by VCRRecorder),
-        the db_interactions key is added/updated. If not, a new cassette is created.
-        """
-        cassette: dict = {}
-        if self.cassette_path.exists():
-            try:
-                with open(self.cassette_path) as f:
-                    cassette = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                cassette = {}
-
-        # Ensure metadata exists
-        if "_metadata" not in cassette:
-            cassette["_metadata"] = {}
-        cassette["_metadata"]["db_driver"] = self.adapter.driver_name
-        cassette["_metadata"]["keboola_db_vcr_version"] = "0.1.0"
-        if "recorded_at" not in cassette["_metadata"]:
-            cassette["_metadata"]["recorded_at"] = datetime.now().isoformat()
-
-        # Ensure vcrpy-compatible structure exists
-        if "interactions" not in cassette:
-            cassette["interactions"] = []
-        if "version" not in cassette:
-            cassette["version"] = 1
-
-        # Add/replace DB interactions
-        cassette["db_interactions"] = interactions
-
-        with open(self.cassette_path, "w") as f:
-            json.dump(cassette, f, indent=2, cls=_DBEncoder)
-
-    def _load_db_interactions(self) -> list[dict]:
-        """Load DB interactions from the shared cassette file."""
-        with open(self.cassette_path) as f:
-            data = json.load(f, object_hook=_db_decode_hook)
-        return data.get("db_interactions", [])
+        return version("keboola.vcr")
+    except Exception:
+        return "unknown"
