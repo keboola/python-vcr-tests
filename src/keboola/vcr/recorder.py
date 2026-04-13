@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any
 
+from .db_recorder import _db_decode_hook, _StreamingDBLog
+
 try:
     import vcr
     from vcr.stubs import VCRHTTPResponse as _VCRHTTPResponse
@@ -454,8 +456,6 @@ class VCRRecorder:
         db_temp_path = self.cassette_path.with_name("db_interactions.jsonl.tmp")
         db_temp_path.unlink(missing_ok=True)
         if self.db_adapters:
-            from .db_recorder import _StreamingDBLog
-
             self._db_interaction_log = _StreamingDBLog(db_temp_path, secrets=self.secrets)
         else:
             self._db_interaction_log = None
@@ -633,8 +633,6 @@ class VCRRecorder:
         if not self.has_cassette():
             return
         try:
-            from .db_recorder import _db_decode_hook
-
             with open(self.cassette_path) as f:
                 data = json.load(f, object_hook=_db_decode_hook)
             interactions = data.get("db_interactions", [])
