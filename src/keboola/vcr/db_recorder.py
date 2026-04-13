@@ -278,7 +278,20 @@ class _RecordingCursor:
         self._cursor.arraysize = value
 
     def execute(self, sql: str, parameters: Any = None, **kwargs: Any) -> Any:
-        result = self._cursor.execute(sql, parameters=parameters, **kwargs)
+        try:
+            result = self._cursor.execute(sql, parameters=parameters, **kwargs)
+        except Exception as e:
+            # Record the error so replay can reproduce it
+            self._current_entry = {
+                "sql_normalized": _normalize_sql(sql),
+                "params_hash": _params_hash(parameters),
+                "description": None,
+                "rows": [],
+                "error": str(e),
+            }
+            self._log.append(self._current_entry)
+            self._current_entry = None
+            raise
         self._current_entry = {
             "sql_normalized": _normalize_sql(sql),
             "params_hash": _params_hash(parameters),
@@ -384,6 +397,15 @@ class _ReplayCursor:
 
     def execute(self, sql: str, parameters: Any = None, **kwargs: Any) -> None:
         entry = self._store.lookup(sql, parameters)
+        # Replay recorded errors — raise the original driver exception type
+        # so the component's error handling catches it correctly.
+        if "error" in entry:
+            try:
+                import oracledb
+
+                raise oracledb.DatabaseError(entry["error"])
+            except ImportError:
+                raise Exception(entry["error"])
         self._description = _expand_description(entry.get("description"))
         self._rows = entry.get("rows", [])
         self._offset = 0

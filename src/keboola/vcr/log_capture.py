@@ -30,9 +30,11 @@ DEFAULT_LOG_LEVEL = logging.DEBUG
 DEFAULT_NORMALIZERS: list[tuple[str, str]] = [
     (r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<UUID>"),
     # Unix epoch timestamps: 10 digits (seconds) to 13 digits (milliseconds).
-    # ISO datetimes are not normalized here — they rarely appear in log messages
-    # and would need format-aware parsing to avoid false positives.
     (r"\b\d{10,13}\b", "<EPOCH>"),
+    # Normalize "File ..." lines in tracebacks to strip directory paths.
+    # Tracebacks contain absolute paths that differ between environments
+    # (recording vs replay, local vs CI, real driver vs VCR mock).
+    (r'File "(?:[^"]*[/\\])([^"]+)"', r'File "\1"'),
 ]
 
 
@@ -241,8 +243,41 @@ def run_with_log_capture(
     return ComponentRunResult(exit_code=exit_code, logs=handler.records, stderr=stderr_buf.getvalue())
 
 
+def _collapse_tracebacks(text: str) -> str:
+    """Collapse Python tracebacks to just the final exception line.
+
+    Tracebacks differ between environments (different intermediate frames
+    for DB VCR mocks vs real drivers, absolute vs relative paths).
+    Keeps the error type + message, strips all frame details.
+
+    Handles chained exceptions (``The above exception was the direct cause...``).
+    """
+    lines = text.split("\n")
+    result: list[str] = []
+    in_traceback = False
+    for line in lines:
+        if line.strip() == "Traceback (most recent call last):":
+            in_traceback = True
+            continue
+        if in_traceback:
+            # Frame lines start with "  File " or whitespace
+            if line.startswith("  ") or line.strip() == "":
+                continue
+            if line.strip().startswith("The above exception"):
+                continue
+            if line.strip().startswith("During handling of"):
+                continue
+            # This is the exception line — keep it, exit traceback
+            in_traceback = False
+            result.append(line)
+        else:
+            result.append(line)
+    return "\n".join(result)
+
+
 def normalize_message(message: str, normalizers: list[tuple[str, str]]) -> str:
-    """Apply regex normalizers sequentially to a log message."""
+    """Apply regex normalizers and traceback collapsing to a log message."""
+    message = _collapse_tracebacks(message)
     for pattern, replacement in normalizers:
         message = re.sub(pattern, replacement, message)
     return message

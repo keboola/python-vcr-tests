@@ -367,19 +367,24 @@ class TestScaffolder:
         # freeze_time is disabled during recording (freezegun conflicts with
         # most DB drivers' internal timezone handling).  Replay still uses
         # freeze_time since DB VCR replay mocks are pure Python.
+        # Create VCR recorder with DB adapters integrated (flat architecture).
+        # When DB adapter is active, skip freeze_time during recording
+        # (freezegun conflicts with real DB driver connections).
         effective_freeze = None if db_adapter is not None else freeze_time_at
+        db_adapters = [db_adapter] if db_adapter else []
         recorder = VCRRecorder.from_test_dir(
             test_data_dir=source_data_dir,
             freeze_time_at=effective_freeze,
             secrets_override=secrets_override,
             sanitizers=component_sanitizers or None,
+            db_adapters=db_adapters,
         )
 
         if regenerate:
             recorder.clear_cassette()
 
-        # Base component runner — disables the component SDK's auto-VCR
-        # detection to prevent a conflicting second VCR layer.
+        # Component runner — disables the component SDK's auto-VCR detection
+        # to prevent a conflicting second VCR layer.
         def run_component():
             os.environ["KBC_DATADIR"] = str(source_data_dir)
             script_dir = str(Path(component_script).resolve().parent)
@@ -400,38 +405,8 @@ class TestScaffolder:
 
                     ComponentBase._should_vcr_replay = original
 
-        # If a DB adapter is provided, wrap the component run with DB VCR
-        # recording so both HTTP and DB interactions are captured in one pass.
-        if db_adapter is not None:
-            db_recorder = DBVCRRecorder.from_test_dir(
-                test_data_dir=source_data_dir,
-                adapter=db_adapter,
-            )
-            if regenerate:
-                db_cassette = db_recorder.cassette_path
-                if db_cassette.exists():
-                    db_cassette.unlink()
-
-            original_run = run_component
-
-            def run_component_with_db():
-                db_recorder.record(original_run)
-
-            actual_runner = run_component_with_db
-        else:
-            actual_runner = run_component
-
         try:
-            # Always go through HTTP VCR recorder — it handles log capture,
-            # sync action stdout, exit code tracking, and HTTP interactions.
-            # DB VCR recording is layered inside.
-            recorder.record(actual_runner)
-
-            # Flush DB interactions AFTER HTTP VCR writes requests.json,
-            # so db_interactions are merged without being overwritten.
-            if db_adapter is not None:
-                db_recorder.flush()
-
+            recorder.record(run_component)
             logger.info(f"Recorded cassette for {test_dir.name}")
         except Exception as e:
             logger.error(f"Failed to record cassette for {test_dir.name}: {e}")
