@@ -384,7 +384,13 @@ class TestScaffolder:
             recorder.clear_cassette()
 
         # Component runner — disables the component SDK's auto-VCR detection
-        # to prevent a conflicting second VCR layer.
+        # to prevent a conflicting second VCR layer during recording.
+        # ComponentBase._should_vcr_replay detects cassettes/requests.json and
+        # wraps the action with its own VCR replay, which would serve old responses
+        # instead of hitting the real API on re-recording runs.
+        # TODO: move this suppression into the component SDK itself (e.g. check
+        # for a _keboola_vcr_managed attribute or similar) so this monkeypatch
+        # is no longer needed.
         def run_component():
             os.environ["KBC_DATADIR"] = str(source_data_dir)
             script_dir = str(Path(component_script).resolve().parent)
