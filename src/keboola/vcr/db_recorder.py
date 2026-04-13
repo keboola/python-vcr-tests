@@ -74,7 +74,7 @@ def _normalize_sql(sql: str) -> str:
 def _params_hash(params: Any) -> str:
     """Stable hash of query parameters for cassette lookup."""
     serialized = json.dumps(params, sort_keys=True, cls=_DBEncoder)
-    return hashlib.md5(serialized.encode()).hexdigest()  # noqa: S324
+    return hashlib.sha256(serialized.encode()).hexdigest()
 
 
 def _slim_description(description: Any) -> list[list] | None:
