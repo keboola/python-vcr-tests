@@ -45,6 +45,11 @@ from .sanitizers import (
     create_default_sanitizer,
     extract_values,
 )
+from .db_recorder import (
+    DBAdapter,
+    DBVCRRecorder,
+    OracleDBAdapter,
+)
 from .scaffolder import (
     ScaffolderError,
     TestScaffolder,
@@ -99,6 +104,10 @@ __all__ = [
     "capture_output_snapshot",
     "save_output_snapshot",
     "validate_output_snapshot",
+    # DB VCR
+    "DBVCRRecorder",
+    "DBAdapter",
+    "OracleDBAdapter",
     # Scaffolder
     "TestScaffolder",
     "ScaffolderError",
