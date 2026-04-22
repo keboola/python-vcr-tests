@@ -159,7 +159,7 @@ class LogSanitizer:
     def __init__(self, secrets: dict[str, Any]) -> None:
         from keboola.vcr.sanitizers import extract_values
 
-        self._secret_values = sorted([str(v) for v in extract_values(secrets) if v], key=len, reverse=True)
+        self._secret_values: list[str] = sorted([str(v) for v in extract_values(secrets) if v], key=len, reverse=True)  # ty: ignore[invalid-assignment]
 
     def sanitize_string(self, text: str) -> str:
         """Replace secret values in an arbitrary string."""
@@ -224,7 +224,7 @@ def run_with_log_capture(
                 # that vary between a fresh-process recording and an in-process replay
                 # (due to per-module __warningregistry__ dedup), causing false diffs.
                 # Real component stderr output (sys.stderr.write / print) is still captured.
-                warnings.showwarning = lambda *_a, **_kw: None
+                warnings.simplefilter("ignore")
                 fn()
     except SystemExit as e:
         if e.code is None:
@@ -310,9 +310,10 @@ def compare_logs(
     """
     if normalizers is None:
         normalizers = DEFAULT_NORMALIZERS
+    effective_normalizers: list[tuple[str, str]] = normalizers
 
     def _normalize_messages(logs: list[CapturedLog]) -> list[str]:
-        return [normalize_message(log.message, normalizers) for log in logs]
+        return [normalize_message(log.message, effective_normalizers) for log in logs]
 
     recorded_messages = _normalize_messages(recorded.logs)
     replayed_messages = _normalize_messages(replayed.logs)

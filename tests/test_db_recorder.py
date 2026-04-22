@@ -177,6 +177,7 @@ class TestDescriptionHelpers:
     def test_expand_reconstructs_7_tuple(self):
         slim = [["id", "NUMBER"], ["name", "VARCHAR2"]]
         result = _expand_description(slim)
+        assert result is not None
         assert len(result) == 2
         assert result[0] == ("id", "NUMBER", None, None, None, None, None)
         assert result[1] == ("name", "VARCHAR2", None, None, None, None, None)
@@ -191,6 +192,7 @@ class TestDescriptionHelpers:
         description = [("col", "DB_TYPE_VARCHAR", 50, 50, None, None, True)]
         slim = _slim_description(description)
         expanded = _expand_description(slim)
+        assert expanded is not None
         assert expanded[0][0] == "col"
         assert expanded[0][1] == "DB_TYPE_VARCHAR"
 

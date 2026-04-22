@@ -118,11 +118,11 @@ class DefaultSanitizer(BaseSanitizer):
             _collect_hash_values(config, all_values)
 
         # Sort known values longest-first to prevent partial JWT replacement
-        self.sensitive_values = sorted(
+        self.sensitive_values: list[str] = sorted(
             [v for v in all_values if v],
             key=len,
             reverse=True,
-        )
+        )  # ty: ignore[invalid-assignment]
         self.replacement = replacement
         # Pre-compile regex for form-encoded/query param matching
         self._field_patterns = [re.compile(rf"({re.escape(f)}=)[^&\"\s]+") for f in self.sensitive_fields]
@@ -814,7 +814,8 @@ class ConfigSecretsSanitizer(BaseSanitizer):
         secrets: list[str] = []
         _collect_hash_values(config, secrets)
         # Sort longest-first to prevent partial replacements
-        return sorted(set(s for s in secrets if s), key=len, reverse=True)
+        result: list[str] = sorted(set(s for s in secrets if s), key=len, reverse=True)  # ty: ignore[invalid-assignment]
+        return result
 
     def _sanitize_string(self, value: str) -> str:
         """Replace all secret values in a string."""
@@ -873,7 +874,7 @@ def _dedup_sanitizers(sanitizers: list[BaseSanitizer]) -> list[BaseSanitizer]:
     for s in sanitizers:
         cls = type(s)
         if cls in by_class and hasattr(result[by_class[cls]], "merge"):
-            result[by_class[cls]] = result[by_class[cls]].merge(s)
+            result[by_class[cls]] = result[by_class[cls]].merge(s)  # ty: ignore[unresolved-attribute]
         else:
             by_class[cls] = len(result)
             result.append(s)

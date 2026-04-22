@@ -358,7 +358,7 @@ class TestScaffolder:
 
         # Load component-defined sanitizers (e.g. GCS signed URL redaction) so
         # that scaffold recording applies the same sanitizers as test replay.
-        from keboola.datadirtest.vcr.tester import _load_vcr_sanitizers_from_script
+        from keboola.datadirtest.vcr.tester import _load_vcr_sanitizers_from_script  # ty: ignore[unresolved-import]
 
         component_sanitizers = _load_vcr_sanitizers_from_script(str(component_script))
 
@@ -397,7 +397,7 @@ class TestScaffolder:
             if script_dir not in sys.path:
                 sys.path.insert(0, script_dir)
             try:
-                from keboola.component.base import ComponentBase
+                from keboola.component.base import ComponentBase  # ty: ignore[unresolved-import]
 
                 original = ComponentBase._should_vcr_replay
                 ComponentBase._should_vcr_replay = staticmethod(lambda: False)
@@ -407,7 +407,7 @@ class TestScaffolder:
                 run_path(str(component_script), run_name="__main__")
             finally:
                 if original is not None:
-                    from keboola.component.base import ComponentBase
+                    from keboola.component.base import ComponentBase  # ty: ignore[unresolved-import]
 
                     ComponentBase._should_vcr_replay = original
 

@@ -122,11 +122,12 @@ class _StreamingDBLog:
         if secrets:
             from keboola.vcr.sanitizers import extract_values
 
-            self._secret_values = sorted(
+            sorted_values: list[str] = sorted(
                 [str(v) for v in extract_values(secrets) if v],
                 key=len,
                 reverse=True,
-            )
+            )  # ty: ignore[invalid-assignment]
+            self._secret_values = sorted_values
 
     def _sanitize_rows(self, rows: list[list]) -> list[list]:
         """Replace secret values (substring match) in row data with [REDACTED]."""
@@ -200,7 +201,7 @@ class OracleDBAdapter(DBAdapter):
         return "oracledb"
 
     def patch_for_record(self, interaction_log: list[dict]) -> None:
-        import oracledb
+        import oracledb  # ty: ignore[unresolved-import]
 
         self._original_connect = oracledb.connect
 
@@ -211,7 +212,7 @@ class OracleDBAdapter(DBAdapter):
         oracledb.connect = recording_connect
 
     def patch_for_replay(self, interactions: list[dict]) -> None:
-        import oracledb
+        import oracledb  # ty: ignore[unresolved-import]
 
         self._original_connect = oracledb.connect
         replay_store = _ReplayStore(interactions, error_class=oracledb.DatabaseError)
@@ -223,7 +224,7 @@ class OracleDBAdapter(DBAdapter):
 
     def unpatch(self) -> None:
         if self._original_connect is not None:
-            import oracledb
+            import oracledb  # ty: ignore[unresolved-import]
 
             oracledb.connect = self._original_connect
             self._original_connect = None

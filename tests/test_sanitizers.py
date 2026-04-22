@@ -185,9 +185,9 @@ class TestCompositeSanitizer:
                 super().__init__()
                 self._name = name
 
-            def before_record_request(self, req):
+            def before_record_request(self, request):
                 calls.append(self._name)
-                return req
+                return request
 
         s = CompositeSanitizer([RecordingS("first"), RecordingS("second")])
         s.before_record_request(_make_request())
@@ -197,13 +197,13 @@ class TestCompositeSanitizer:
         seen = []
 
         class TrackingS(DefaultSanitizer):
-            def before_record_request(self, req):
+            def before_record_request(self, request):
                 seen.append("req")
-                return req
+                return request
 
-            def before_record_response(self, resp):
+            def before_record_response(self, response):
                 seen.append("resp")
-                return resp
+                return response
 
         s = CompositeSanitizer([TrackingS()])
         s.before_record_request(_make_request())

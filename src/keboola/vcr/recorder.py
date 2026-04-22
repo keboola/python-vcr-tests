@@ -73,7 +73,7 @@ try:
                 return True
             return False
 
-        _VCRConnection.is_connected = _vcr_is_connected  # type: ignore[attr-defined]
+        _VCRConnection.is_connected = _vcr_is_connected  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         del _vcr_is_connected, _VCRHTTPConnection, _VCRConnection
     except Exception:
         pass
@@ -110,7 +110,7 @@ try:
                 pool._put_conn(conn)
                 self._connection = None
 
-        _VCRHTTPResponse.release_conn = _vcr_release_conn  # type: ignore[attr-defined]
+        _VCRHTTPResponse.release_conn = _vcr_release_conn  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     # --- end VCRHTTPResponse.release_conn fix ---
 
 except ImportError:
@@ -246,7 +246,7 @@ class VCRRecorder:
         # DB protocol adapters — patched alongside HTTP VCR at the same level.
         # Each adapter patches its driver's connect() before the component runs.
         self.db_adapters: list = db_adapters or []
-        self._db_interaction_log: list[dict] = []
+        self._db_interaction_log: _StreamingDBLog | list[dict] | None = []
 
         # Set after replay — can be checked by callers (e.g. VCRTestDataDir)
         self.last_log_comparison: LogComparisonResult | None = None
@@ -443,7 +443,7 @@ class VCRRecorder:
         # Single-threaded component execution is assumed; do not call record()
         # from multiple threads simultaneously.
         _original_vcr_init = _VCRHTTPResponse.__init__
-        _VCRHTTPResponse.__init__ = functools.partialmethod(
+        _VCRHTTPResponse.__init__ = functools.partialmethod(  # ty: ignore[invalid-assignment]
             _zero_copy_vcr_response_init, original_init=_original_vcr_init
         )
 
@@ -483,7 +483,7 @@ class VCRRecorder:
             else:
                 _run_in_vcr()
         finally:
-            _VCRHTTPResponse.__init__ = _original_vcr_init
+            _VCRHTTPResponse.__init__ = _original_vcr_init  # ty: ignore[invalid-assignment]
             # Unpatch all DB adapters
             for adapter in self.db_adapters:
                 adapter.unpatch()
@@ -972,13 +972,13 @@ class _BytesEncoder(json.JSONEncoder):
     so the cassette format is byte-for-byte identical.
     """
 
-    def default(self, obj):
-        if isinstance(obj, bytes):
+    def default(self, o):
+        if isinstance(o, bytes):
             try:
-                return obj.decode("utf-8")
+                return o.decode("utf-8")
             except UnicodeDecodeError:
-                return base64.b64encode(obj).decode("ascii")
-        return super().default(obj)
+                return base64.b64encode(o).decode("ascii")
+        return super().default(o)
 
 
 class _VCRRecordingReader:
@@ -1116,7 +1116,7 @@ def _pool_reuse_patch():
     created (and cached) here already carry vcrpy's patched connection stubs.
     """
     try:
-        from urllib3.poolmanager import PoolManager
+        from urllib3.poolmanager import PoolManager  # ty: ignore[unresolved-import]
     except ImportError:
         yield
         return
@@ -1136,7 +1136,7 @@ def _pool_reuse_patch():
         if pool.conn_kw.get("ssl_context") is not None:
             return
         try:
-            from urllib3.util.ssl_ import create_urllib3_context
+            from urllib3.util.ssl_ import create_urllib3_context  # ty: ignore[unresolved-import]
 
             ctx = create_urllib3_context()
             # load_default_certs() is only called by urllib3 when it creates its own
