@@ -3,7 +3,7 @@
 VCR recording, sanitization, and validation for Keboola component HTTP interactions.
 
 ## Installation
-
+ 
 ```bash
 pip install keboola.vcr
 ```
