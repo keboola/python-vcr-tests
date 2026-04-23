@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any
 
+from .db_recorder import _db_decode_hook, _StreamingDBLog
+
 try:
     import vcr
     from vcr.stubs import VCRHTTPResponse as _VCRHTTPResponse
@@ -71,7 +73,7 @@ try:
                 return True
             return False
 
-        _VCRConnection.is_connected = _vcr_is_connected  # type: ignore[attr-defined]
+        _VCRConnection.is_connected = _vcr_is_connected  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         del _vcr_is_connected, _VCRHTTPConnection, _VCRConnection
     except Exception:
         pass
@@ -108,7 +110,7 @@ try:
                 pool._put_conn(conn)
                 self._connection = None
 
-        _VCRHTTPResponse.release_conn = _vcr_release_conn  # type: ignore[attr-defined]
+        _VCRHTTPResponse.release_conn = _vcr_release_conn  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     # --- end VCRHTTPResponse.release_conn fix ---
 
 except ImportError:
@@ -195,6 +197,7 @@ class VCRRecorder:
         capture_logs: bool = True,
         log_normalizers: list[tuple[str, str]] | None = None,
         ignored_loggers: set[str] | None = None,
+        db_adapters: list | None = None,
     ):
         """
         Initialize VCR recorder.
@@ -239,6 +242,11 @@ class VCRRecorder:
         self.logs_path = self.cassette_dir / "logs.json"
         self.sync_action_result_path = self.cassette_dir / "sync_action_result.json"
         self.expected_status_path = self.cassette_dir / "expected_status.json"
+
+        # DB protocol adapters — patched alongside HTTP VCR at the same level.
+        # Each adapter patches its driver's connect() before the component runs.
+        self.db_adapters: list = db_adapters or []
+        self._db_interaction_log: _StreamingDBLog | list[dict] | None = []
 
         # Set after replay — can be checked by callers (e.g. VCRTestDataDir)
         self.last_log_comparison: LogComparisonResult | None = None
@@ -435,23 +443,30 @@ class VCRRecorder:
         # Single-threaded component execution is assumed; do not call record()
         # from multiple threads simultaneously.
         _original_vcr_init = _VCRHTTPResponse.__init__
-        _VCRHTTPResponse.__init__ = functools.partialmethod(
+        _VCRHTTPResponse.__init__ = functools.partialmethod(  # ty: ignore[invalid-assignment]
             _zero_copy_vcr_response_init, original_init=_original_vcr_init
         )
 
         vcr_context = self._vcr.use_cassette(str(self.cassette_path), record_mode="all")
 
+        # Activate DB adapters for recording — patches happen at the same level
+        # as HTTP VCR (not nested inside). All adapters are active simultaneously.
+        # DB interactions stream to a temp JSONL file (same pattern as HTTP)
+        # to avoid OOM on large result sets.
+        db_temp_path = self.cassette_path.with_name("db_interactions.jsonl.tmp")
+        db_temp_path.unlink(missing_ok=True)
+        if self.db_adapters:
+            self._db_interaction_log = _StreamingDBLog(db_temp_path, secrets=self.secrets)
+        else:
+            self._db_interaction_log = None
+        for adapter in self.db_adapters:
+            adapter.patch_for_record(self._db_interaction_log)
+
         def _run_in_vcr():
             with vcr_context as cassette:
-                # Capture the cassette's full filter chain so that vcrpy's built-in
-                # decode_compressed_response hook (and our sanitizer) both run inside
-                # _append_interaction.  Without this, patching cassette.append would
-                # bypass the chain, leaving gzip response bodies un-decompressed in
-                # the cassette.
                 cassette.append = functools.partial(
                     self._append_interaction, temp_path, cassette._before_record_response
                 )
-                # Suppress the context-exit _save() — we write directly to temp_path
                 cassette._save = lambda force=False: None
 
                 with _pool_reuse_patch():
@@ -468,7 +483,10 @@ class VCRRecorder:
             else:
                 _run_in_vcr()
         finally:
-            _VCRHTTPResponse.__init__ = _original_vcr_init
+            _VCRHTTPResponse.__init__ = _original_vcr_init  # ty: ignore[invalid-assignment]
+            # Unpatch all DB adapters
+            for adapter in self.db_adapters:
+                adapter.unpatch()
 
         if stdout_capture is not None:
             self._remove_leaked_stdout_handlers(stdout_capture)
@@ -490,10 +508,16 @@ class VCRRecorder:
             "freeze_time": self.freeze_time_at,
             "keboola_vcr_version": self._get_version(),
         }
+        # Add DB adapter metadata
+        if self.db_adapters:
+            metadata["db_driver"] = self.db_adapters[0].driver_name
+            metadata["keboola_db_vcr_version"] = self._get_version()
+
         try:
-            self._write_cassette(temp_path, metadata)
+            self._write_cassette(temp_path, metadata, db_temp_path=db_temp_path)
         finally:
             temp_path.unlink(missing_ok=True)
+            db_temp_path.unlink(missing_ok=True)
         logger.info(f"Recorded cassette to {self.cassette_path}")
 
     def replay(self, component_runner: Callable[[], None]) -> None:
@@ -530,10 +554,12 @@ class VCRRecorder:
         else:
             logger.info("No cassette found — running without HTTP replay (log/sync-action capture only)")
             vcr_context = contextlib.nullcontext()
-            # No cassette metadata to read from — honour an explicit freeze time but
-            # don't fall back to DEFAULT_FREEZE_TIME for live-network runs.
             ft = self.freeze_time_at
             effective_freeze_time = ft if ft and ft != "auto" else None
+
+        # Activate DB adapters for replay — load db_interactions from cassette
+        # and patch drivers at the same level as HTTP VCR.
+        self._activate_db_replay()
 
         def _run_in_vcr():
             self._is_replaying = True
@@ -546,6 +572,7 @@ class VCRRecorder:
                         self._run_with_freeze(component_runner, effective_freeze_time)
             finally:
                 self._is_replaying = False
+                self._deactivate_db_adapters()
 
         run_result: ComponentRunResult | None = None
         if self.capture_logs:
@@ -599,6 +626,28 @@ class VCRRecorder:
         except Exception:
             return "run"
 
+    def _activate_db_replay(self) -> None:
+        """Load db_interactions from cassette and patch all DB adapters for replay."""
+        if not self.db_adapters:
+            return
+        if not self.has_cassette():
+            return
+        try:
+            with open(self.cassette_path) as f:
+                data = json.load(f, object_hook=_db_decode_hook)
+            interactions = data.get("db_interactions", [])
+            if interactions:
+                for adapter in self.db_adapters:
+                    adapter.patch_for_replay(interactions)
+                logger.info("DB replay activated: %d interactions loaded", len(interactions))
+        except Exception as e:
+            logger.warning("Failed to activate DB replay: %s", e)
+
+    def _deactivate_db_adapters(self) -> None:
+        """Unpatch all DB adapters."""
+        for adapter in self.db_adapters:
+            adapter.unpatch()
+
     def _run_with_freeze(self, runner: Callable[[], None], freeze_time_val: str | None = None) -> None:
         """Run runner inside optional freeze_time context."""
         ft = freeze_time_val if freeze_time_val is not None else self.freeze_time_at
@@ -643,7 +692,8 @@ class VCRRecorder:
         """
         root = logging.getLogger()
         root.handlers = [
-            h for h in root.handlers
+            h
+            for h in root.handlers
             if not (isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is stdout_capture)
         ]
 
@@ -694,9 +744,7 @@ class VCRRecorder:
             replayed_raw = stdout_capture.getvalue().strip()
             if self.secrets:
                 replayed_raw = LogSanitizer(self.secrets).sanitize_string(replayed_raw)
-            self.last_sync_action_comparison = self._compare_sync_action_result(
-                recorded_raw, replayed_raw
-            )
+            self.last_sync_action_comparison = self._compare_sync_action_result(recorded_raw, replayed_raw)
 
         if actual_exit != expected_exit:
             if actual_exit != 0:
@@ -755,29 +803,45 @@ class VCRRecorder:
         logger.info(f"Auto-resolved freeze_time from cassette metadata: {resolved}")
         return resolved
 
-    def _write_cassette(self, temp_path: Path, metadata: dict) -> None:
-        """Stream-write the cassette JSON from the JSONL temp file with inline metadata.
+    def _write_cassette(self, temp_path: Path, metadata: dict, db_temp_path: Path | None = None) -> None:
+        """Stream-write the cassette JSON from JSONL temp files.
 
-        Writes the output file line-by-line to avoid loading all interactions into
-        memory at once (avoids a secondary OOM spike after recording finishes).
+        Both HTTP interactions (from *temp_path*) and DB interactions (from
+        *db_temp_path*) are streamed line-by-line to avoid loading all data
+        into memory at once.
         """
         with open(self.cassette_path, "w") as out:
             out.write("{\n")
             out.write('  "_metadata": ' + json.dumps(metadata, sort_keys=True) + ",\n")
-            out.write('  "interactions": [\n')
-            first = True
-            if temp_path.exists():
-                with open(temp_path) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if not first:
-                            out.write(",\n")
-                        out.write("    ")
-                        out.write(line)
-                        first = False
-            out.write('\n  ],\n  "version": 1\n}\n')
+
+            self._stream_jsonl_array(out, "interactions", temp_path if temp_path.exists() else None)
+            if db_temp_path is not None and db_temp_path.exists():
+                self._stream_jsonl_array(out, "db_interactions", db_temp_path)
+
+            out.write('  "version": 1\n}\n')
+
+    @staticmethod
+    def _stream_jsonl_array(out: Any, key: str, source_path: Path | None) -> None:
+        """Stream a JSONL file as a JSON array field into *out*.
+
+        Always emits the ``"<key>": [...]`` wrapper (possibly empty) so the
+        resulting cassette has a stable schema, and always terminates with
+        ``,\\n`` so the caller can append the next field.
+        """
+        out.write(f'  "{key}": [\n')
+        first = True
+        if source_path is not None:
+            with open(source_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if not first:
+                        out.write(",\n")
+                    out.write("    ")
+                    out.write(line)
+                    first = False
+        out.write("\n  ],\n")
 
     def _before_record_request(self, request: Any) -> Any:
         """Apply sanitizers before recording request."""
@@ -903,13 +967,13 @@ class _BytesEncoder(json.JSONEncoder):
     so the cassette format is byte-for-byte identical.
     """
 
-    def default(self, obj):
-        if isinstance(obj, bytes):
+    def default(self, o):
+        if isinstance(o, bytes):
             try:
-                return obj.decode("utf-8")
+                return o.decode("utf-8")
             except UnicodeDecodeError:
-                return base64.b64encode(obj).decode("ascii")
-        return super().default(obj)
+                return base64.b64encode(o).decode("ascii")
+        return super().default(o)
 
 
 class _VCRRecordingReader:
@@ -1047,7 +1111,7 @@ def _pool_reuse_patch():
     created (and cached) here already carry vcrpy's patched connection stubs.
     """
     try:
-        from urllib3.poolmanager import PoolManager
+        from urllib3.poolmanager import PoolManager  # ty: ignore[unresolved-import]
     except ImportError:
         yield
         return
@@ -1067,7 +1131,7 @@ def _pool_reuse_patch():
         if pool.conn_kw.get("ssl_context") is not None:
             return
         try:
-            from urllib3.util.ssl_ import create_urllib3_context
+            from urllib3.util.ssl_ import create_urllib3_context  # ty: ignore[unresolved-import]
 
             ctx = create_urllib3_context()
             # load_default_certs() is only called by urllib3 when it creates its own

@@ -61,6 +61,7 @@ from pathlib import Path
 from runpy import run_path
 from typing import Any
 
+from .db_recorder import DBAdapter, OracleDBAdapter
 from .recorder import VCRRecorder
 from .validator import save_output_snapshot
 
@@ -104,6 +105,7 @@ class TestScaffolder:
         chain_state: bool = False,
         regenerate: bool = False,
         input_files_dir: Path | None = None,
+        db_adapter: DBAdapter | None = None,
     ) -> list[Path]:
         """
         Create test folders from definitions file.
@@ -153,8 +155,15 @@ class TestScaffolder:
         if record and component_script is None:
             raise ScaffolderError("component_script is required when record=True")
 
-        # Default freeze time to the current moment so replays match recording conditions
-        if freeze_time_at is None:
+        # Auto-detect DB adapter from component imports if not explicitly provided
+        if db_adapter is None and record and component_script:
+            db_adapter = self._auto_detect_db_adapter(component_script)
+
+        # Default freeze time to the current moment so replays match recording conditions.
+        # Skip freeze_time when a DB adapter is active — freezegun conflicts with
+        # most database drivers' internal timezone/datetime handling during recording.
+        # (Replay still uses freeze_time since DB VCR mocks are pure Python.)
+        if freeze_time_at is None and db_adapter is None:
             freeze_time_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
         # Auto-detect raw Keboola configs and transform
@@ -185,6 +194,7 @@ class TestScaffolder:
                 input_state=chained_state,
                 regenerate=regenerate,
                 input_files_dir=Path(input_files_dir) if input_files_dir is not None else None,
+                db_adapter=db_adapter,
             )
             created_paths.append(test_path)
 
@@ -248,6 +258,7 @@ class TestScaffolder:
         input_state: dict[str, Any] | None = None,
         regenerate: bool = False,
         input_files_dir: Path | None = None,
+        db_adapter: DBAdapter | None = None,
     ) -> Path:
         """Create folder structure for a single test."""
         # Validate definition
@@ -310,6 +321,7 @@ class TestScaffolder:
                     freeze_time_at=freeze_time_at,
                     secrets_override=secrets_override,
                     regenerate=regenerate,
+                    db_adapter=db_adapter,
                 )
 
         return test_dir
@@ -324,6 +336,7 @@ class TestScaffolder:
         freeze_time_at: str | None,
         secrets_override: dict[str, Any] | None = None,
         regenerate: bool = False,
+        db_adapter: DBAdapter | None = None,
     ) -> None:
         """Run component and record cassette.
 
@@ -345,32 +358,58 @@ class TestScaffolder:
 
         # Load component-defined sanitizers (e.g. GCS signed URL redaction) so
         # that scaffold recording applies the same sanitizers as test replay.
-        from keboola.datadirtest.vcr.tester import _load_vcr_sanitizers_from_script
+        from keboola.datadirtest.vcr.tester import _load_vcr_sanitizers_from_script  # ty: ignore[unresolved-import]
 
         component_sanitizers = _load_vcr_sanitizers_from_script(str(component_script))
 
-        # Create recorder — pass secrets_override so the sanitizer knows
-        # about the real credential values even though config.json on disk
-        # may contain dummy placeholders.
+        # Create HTTP VCR recorder — always used for log capture, sync action
+        # capture, and exit code tracking.  When a DB adapter is active,
+        # freeze_time is disabled during recording (freezegun conflicts with
+        # most DB drivers' internal timezone handling).  Replay still uses
+        # freeze_time since DB VCR replay mocks are pure Python.
+        # Create VCR recorder with DB adapters integrated (flat architecture).
+        # When DB adapter is active, skip freeze_time during recording
+        # (freezegun conflicts with real DB driver connections).
+        effective_freeze = None if db_adapter is not None else freeze_time_at
+        db_adapters = [db_adapter] if db_adapter else []
         recorder = VCRRecorder.from_test_dir(
             test_data_dir=source_data_dir,
-            freeze_time_at=freeze_time_at,
+            freeze_time_at=effective_freeze,
             secrets_override=secrets_override,
             sanitizers=component_sanitizers or None,
+            db_adapters=db_adapters,
         )
 
         if regenerate:
             recorder.clear_cassette()
 
-        # Run component with recording
+        # Component runner — disables the component SDK's auto-VCR detection
+        # to prevent a conflicting second VCR layer during recording.
+        # ComponentBase._should_vcr_replay detects cassettes/requests.json and
+        # wraps the action with its own VCR replay, which would serve old responses
+        # instead of hitting the real API on re-recording runs.
+        # TODO: move this suppression into the component SDK itself (e.g. check
+        # for a _keboola_vcr_managed attribute or similar) so this monkeypatch
+        # is no longer needed.
         def run_component():
             os.environ["KBC_DATADIR"] = str(source_data_dir)
-            # Add the component script's directory to sys.path so that
-            # sibling imports (e.g. ``from configuration import ...``) resolve.
             script_dir = str(Path(component_script).resolve().parent)
             if script_dir not in sys.path:
                 sys.path.insert(0, script_dir)
-            run_path(str(component_script), run_name="__main__")
+            try:
+                from keboola.component.base import ComponentBase  # ty: ignore[unresolved-import]
+
+                original = ComponentBase._should_vcr_replay
+                ComponentBase._should_vcr_replay = staticmethod(lambda: False)
+            except ImportError:
+                original = None
+            try:
+                run_path(str(component_script), run_name="__main__")
+            finally:
+                if original is not None:
+                    from keboola.component.base import ComponentBase  # ty: ignore[unresolved-import]
+
+                    ComponentBase._should_vcr_replay = original
 
         try:
             recorder.record(run_component)
@@ -506,6 +545,43 @@ class TestScaffolder:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _auto_detect_db_adapter(component_script: Path) -> DBAdapter | None:
+        """Auto-detect DB adapter by scanning the component's dependencies.
+
+        Checks the component's pyproject.toml or source files for known DB driver
+        imports. Returns the appropriate adapter or None if no DB driver is found.
+        """
+        # Known DB drivers and their adapters
+        driver_map: dict[str, type[DBAdapter]] = {
+            "oracledb": OracleDBAdapter,
+            # Future: "psycopg2": Psycopg2Adapter, "mysql.connector": MySQLAdapter
+        }
+
+        # Strategy 1: Check pyproject.toml dependencies
+        project_dir = Path(component_script).resolve().parent.parent
+        pyproject = project_dir / "pyproject.toml"
+        if pyproject.exists():
+            content = pyproject.read_text()
+            for driver_name, adapter_cls in driver_map.items():
+                if driver_name in content:
+                    logger.info(f"Auto-detected DB driver '{driver_name}' from pyproject.toml")
+                    return adapter_cls()
+
+        # Strategy 2: Scan source files for import statements
+        src_dir = Path(component_script).resolve().parent
+        for py_file in src_dir.glob("*.py"):
+            try:
+                content = py_file.read_text()
+                for driver_name, adapter_cls in driver_map.items():
+                    if f"import {driver_name}" in content:
+                        logger.info(f"Auto-detected DB driver '{driver_name}' from {py_file.name}")
+                        return adapter_cls()
+            except OSError:
+                continue
+
+        return None
 
     @staticmethod
     def _pretty_print_manifest(path: Path) -> None:

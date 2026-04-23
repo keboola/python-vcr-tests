@@ -12,6 +12,10 @@ Usage:
     from keboola.vcr.sanitizers import ConfigSecretsSanitizer
 """
 
+from .db_recorder import (
+    DBAdapter,
+    OracleDBAdapter,
+)
 from .log_capture import (
     CapturedLog,
     ComponentRunResult,
@@ -99,6 +103,9 @@ __all__ = [
     "capture_output_snapshot",
     "save_output_snapshot",
     "validate_output_snapshot",
+    # DB VCR
+    "DBAdapter",
+    "OracleDBAdapter",
     # Scaffolder
     "TestScaffolder",
     "ScaffolderError",

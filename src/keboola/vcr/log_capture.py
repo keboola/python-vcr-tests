@@ -30,25 +30,27 @@ DEFAULT_LOG_LEVEL = logging.DEBUG
 DEFAULT_NORMALIZERS: list[tuple[str, str]] = [
     (r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<UUID>"),
     # Unix epoch timestamps: 10 digits (seconds) to 13 digits (milliseconds).
-    # ISO datetimes are not normalized here — they rarely appear in log messages
-    # and would need format-aware parsing to avoid false positives.
     (r"\b\d{10,13}\b", "<EPOCH>"),
+    # Normalize "File ..." lines in tracebacks to strip directory paths.
+    # Tracebacks contain absolute paths that differ between environments
+    # (recording vs replay, local vs CI, real driver vs VCR mock).
+    (r'File "(?:[^"]*[/\\])([^"]+)"', r'File "\1"'),
 ]
 
 
 @dataclass
 class CapturedLog:
-    level: str          # "INFO", "ERROR", etc.
-    logger_name: str    # e.g. "src.component"
-    message: str        # formatted log message (exc_text appended if present)
-    timestamp: str      # ISO8601 UTC timestamp, e.g. "2025-01-01T12:00:01.234Z"
+    level: str  # "INFO", "ERROR", etc.
+    logger_name: str  # e.g. "src.component"
+    message: str  # formatted log message (exc_text appended if present)
+    timestamp: str  # ISO8601 UTC timestamp, e.g. "2025-01-01T12:00:01.234Z"
 
 
 @dataclass
 class ComponentRunResult:
-    exit_code: int | None   # None = clean exit (treated as 0), 1 = UserException, 2 = AppError
+    exit_code: int | None  # None = clean exit (treated as 0), 1 = UserException, 2 = AppError
     logs: list[CapturedLog] = field(default_factory=list)
-    stderr: str = ""        # raw stderr output (e.g. sync action error messages, tracebacks)
+    stderr: str = ""  # raw stderr output (e.g. sync action error messages, tracebacks)
 
     def to_dict(self) -> dict:
         return {
@@ -82,7 +84,7 @@ class ComponentRunResult:
 @dataclass
 class LogComparisonResult:
     success: bool
-    diffs: list[str]    # unified_diff lines for log messages and stderr combined
+    diffs: list[str]  # unified_diff lines for log messages and stderr combined
     summary: str
 
     def format_output(self, verbose: bool = False) -> str:
@@ -95,7 +97,7 @@ class LogComparisonResult:
 @dataclass
 class SyncActionComparisonResult:
     success: bool
-    diff: str   # unified_diff string, empty when success=True
+    diff: str  # unified_diff string, empty when success=True
 
 
 class LogCaptureHandler(logging.Handler):
@@ -126,9 +128,9 @@ class LogCaptureHandler(logging.Handler):
                 record.exc_text = self._formatter.formatException(record.exc_info)
             if record.exc_text:
                 message = f"{message}\n{record.exc_text}"
-            timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%S.%f"
-            )[:-3] + "Z"
+            timestamp = (
+                datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            )
             self._records.append(
                 CapturedLog(
                     level=record.levelname,
@@ -157,9 +159,7 @@ class LogSanitizer:
     def __init__(self, secrets: dict[str, Any]) -> None:
         from keboola.vcr.sanitizers import extract_values
 
-        self._secret_values = sorted(
-            [str(v) for v in extract_values(secrets) if v], key=len, reverse=True
-        )
+        self._secret_values: list[str] = sorted([str(v) for v in extract_values(secrets) if v], key=len, reverse=True)  # ty: ignore[invalid-assignment]
 
     def sanitize_string(self, text: str) -> str:
         """Replace secret values in an arbitrary string."""
@@ -224,7 +224,7 @@ def run_with_log_capture(
                 # that vary between a fresh-process recording and an in-process replay
                 # (due to per-module __warningregistry__ dedup), causing false diffs.
                 # Real component stderr output (sys.stderr.write / print) is still captured.
-                warnings.showwarning = lambda *_a, **_kw: None
+                warnings.simplefilter("ignore")
                 fn()
     except SystemExit as e:
         if e.code is None:
@@ -241,8 +241,41 @@ def run_with_log_capture(
     return ComponentRunResult(exit_code=exit_code, logs=handler.records, stderr=stderr_buf.getvalue())
 
 
+def _collapse_tracebacks(text: str) -> str:
+    """Collapse Python tracebacks to just the final exception line.
+
+    Tracebacks differ between environments (different intermediate frames
+    for DB VCR mocks vs real drivers, absolute vs relative paths).
+    Keeps the error type + message, strips all frame details.
+
+    Handles chained exceptions (``The above exception was the direct cause...``).
+    """
+    lines = text.split("\n")
+    result: list[str] = []
+    in_traceback = False
+    for line in lines:
+        if line.strip() == "Traceback (most recent call last):":
+            in_traceback = True
+            continue
+        if in_traceback:
+            # Frame lines start with "  File " or whitespace
+            if line.startswith("  ") or line.strip() == "":
+                continue
+            if line.strip().startswith("The above exception"):
+                continue
+            if line.strip().startswith("During handling of"):
+                continue
+            # This is the exception line — keep it, exit traceback
+            in_traceback = False
+            result.append(line)
+        else:
+            result.append(line)
+    return "\n".join(result)
+
+
 def normalize_message(message: str, normalizers: list[tuple[str, str]]) -> str:
-    """Apply regex normalizers sequentially to a log message."""
+    """Apply regex normalizers and traceback collapsing to a log message."""
+    message = _collapse_tracebacks(message)
     for pattern, replacement in normalizers:
         message = re.sub(pattern, replacement, message)
     return message
@@ -277,9 +310,10 @@ def compare_logs(
     """
     if normalizers is None:
         normalizers = DEFAULT_NORMALIZERS
+    effective_normalizers: list[tuple[str, str]] = normalizers
 
     def _normalize_messages(logs: list[CapturedLog]) -> list[str]:
-        return [normalize_message(log.message, normalizers) for log in logs]
+        return [normalize_message(log.message, effective_normalizers) for log in logs]
 
     recorded_messages = _normalize_messages(recorded.logs)
     replayed_messages = _normalize_messages(replayed.logs)
@@ -297,15 +331,19 @@ def compare_logs(
     recorded_stderr = normalize_message(recorded.stderr, normalizers)
     replayed_stderr = normalize_message(replayed.stderr, normalizers)
     stderr_match = recorded_stderr == replayed_stderr
-    stderr_diffs = list(
-        difflib.unified_diff(
-            recorded_stderr.splitlines(),
-            replayed_stderr.splitlines(),
-            fromfile="recorded stderr",
-            tofile="replayed stderr",
-            lineterm="",
+    stderr_diffs = (
+        list(
+            difflib.unified_diff(
+                recorded_stderr.splitlines(),
+                replayed_stderr.splitlines(),
+                fromfile="recorded stderr",
+                tofile="replayed stderr",
+                lineterm="",
+            )
         )
-    ) if not stderr_match else []
+        if not stderr_match
+        else []
+    )
 
     success = not message_diffs and stderr_match
 
