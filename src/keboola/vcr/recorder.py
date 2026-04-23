@@ -814,39 +814,34 @@ class VCRRecorder:
             out.write("{\n")
             out.write('  "_metadata": ' + json.dumps(metadata, sort_keys=True) + ",\n")
 
-            # Stream HTTP interactions
-            out.write('  "interactions": [\n')
-            first = True
-            if temp_path.exists():
-                with open(temp_path) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if not first:
-                            out.write(",\n")
-                        out.write("    ")
-                        out.write(line)
-                        first = False
-            out.write("\n  ],\n")
-
-            # Stream DB interactions from temp JSONL file
+            self._stream_jsonl_array(out, "interactions", temp_path if temp_path.exists() else None)
             if db_temp_path is not None and db_temp_path.exists():
-                out.write('  "db_interactions": [\n')
-                first = True
-                with open(db_temp_path) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if not first:
-                            out.write(",\n")
-                        out.write("    ")
-                        out.write(line)
-                        first = False
-                out.write("\n  ],\n")
+                self._stream_jsonl_array(out, "db_interactions", db_temp_path)
 
             out.write('  "version": 1\n}\n')
+
+    @staticmethod
+    def _stream_jsonl_array(out: Any, key: str, source_path: Path | None) -> None:
+        """Stream a JSONL file as a JSON array field into *out*.
+
+        Always emits the ``"<key>": [...]`` wrapper (possibly empty) so the
+        resulting cassette has a stable schema, and always terminates with
+        ``,\\n`` so the caller can append the next field.
+        """
+        out.write(f'  "{key}": [\n')
+        first = True
+        if source_path is not None:
+            with open(source_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if not first:
+                        out.write(",\n")
+                    out.write("    ")
+                    out.write(line)
+                    first = False
+        out.write("\n  ],\n")
 
     def _before_record_request(self, request: Any) -> Any:
         """Apply sanitizers before recording request."""
