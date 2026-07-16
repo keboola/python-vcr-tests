@@ -13,6 +13,7 @@ from keboola.vcr.recorder import (
     VCRRecorder,
     _BytesEncoder,
     _VCRRecordingReader,
+    _zero_copy_vcr_response_init,
 )
 from keboola.vcr.sanitizers import CompositeSanitizer, DefaultSanitizer
 
@@ -118,6 +119,52 @@ class TestVCRRecordingReader:
         r = _VCRRecordingReader(b"hello")
         pos = r.seek(100, 0)
         assert pos == 5
+
+
+# ---------------------------------------------------------------------------
+# _zero_copy_vcr_response_init
+# ---------------------------------------------------------------------------
+
+
+class _FakeVCRResponse:
+    """Minimal stand-in for vcr.stubs.VCRHTTPResponse used to test the patch."""
+
+    def _811_init(self, recorded_response):
+        """vcrpy <= 8.1.1 signature: only the recorded response."""
+        self.recorded_response = recorded_response
+        self._content = None
+
+    def _82_init(self, recorded_response, request_url=None):
+        """vcrpy >= 8.2.0 signature: request_url added as a positional arg."""
+        self.recorded_response = recorded_response
+        self.request_url = request_url
+        self._content = None
+
+
+class TestZeroCopyVCRResponseInit:
+    def test_forwards_811_single_positional(self):
+        resp = _FakeVCRResponse()
+        recorded = {"body": {"string": b"payload"}}
+        _zero_copy_vcr_response_init(
+            resp, recorded, original_init=_FakeVCRResponse._811_init
+        )
+        assert isinstance(resp._content, _VCRRecordingReader)
+        assert resp._content.read() == b"payload"
+
+    def test_forwards_82_request_url_positional(self):
+        """vcrpy 8.2+ calls VCRHTTPResponse(response, request_url) — the extra
+        positional must be accepted and forwarded to the original init."""
+        resp = _FakeVCRResponse()
+        recorded = {"body": {"string": b"payload"}}
+        _zero_copy_vcr_response_init(
+            resp,
+            recorded,
+            "https://example.com/api",
+            original_init=_FakeVCRResponse._82_init,
+        )
+        assert isinstance(resp._content, _VCRRecordingReader)
+        assert resp._content.read() == b"payload"
+        assert resp.request_url == "https://example.com/api"
 
 
 # ---------------------------------------------------------------------------
