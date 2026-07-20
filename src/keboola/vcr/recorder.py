@@ -1163,12 +1163,18 @@ def _pool_reuse_patch():
         _shared_pools.clear()
 
 
-def _zero_copy_vcr_response_init(self_resp, recorded_response, *, original_init) -> None:
+def _zero_copy_vcr_response_init(self_resp, recorded_response, *args, original_init) -> None:
     """Patch target for VCRHTTPResponse.__init__ during recording.
 
     Swaps BytesIO for a _VCRRecordingReader so the response body bytes are
     not copied into a second buffer.  ``original_init`` is passed via
     functools.partial so this can live at module level without a closure.
+
+    ``*args`` captures any trailing positional arguments vcrpy passes to
+    VCRHTTPResponse.__init__ and forwards them to ``original_init`` unchanged.
+    vcrpy 8.2.0 added a positional ``request_url`` (instantiated as
+    ``VCRHTTPResponse(response, request_url)``); older versions pass only the
+    recorded response.  Forwarding ``*args`` keeps us compatible with both.
     """
     body = recorded_response.get("body", {})
     original_bytes = body.pop("string", b"")
@@ -1180,6 +1186,6 @@ def _zero_copy_vcr_response_init(self_resp, recorded_response, *, original_init)
     # directly.  Removing or reordering these three lines re-introduces the 2×
     # memory overhead that this function was created to eliminate.
     body["string"] = b""
-    original_init(self_resp, recorded_response)
+    original_init(self_resp, recorded_response, *args)
     self_resp._content = _VCRRecordingReader(original_bytes)
     del body["string"]
