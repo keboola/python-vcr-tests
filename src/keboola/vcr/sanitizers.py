@@ -902,8 +902,12 @@ class ConfigSecretsSanitizer(BaseSanitizer):
 def _dedup_sanitizers(sanitizers: list[BaseSanitizer]) -> list[BaseSanitizer]:
     """Merge same-class sanitizers to avoid redundant processing passes.
 
-    Sanitizers with differing ``scrub_before_read`` are never merged, so a
-    pre-read (PII) sanitizer is kept distinct from a cassette-only one.
+    Order is preserved: the first occurrence of a given key keeps its
+    position in the result, later occurrences are merged into it. Classes
+    without a ``merge()`` method are kept as-is (duplicates are not merged,
+    just left in place). Sanitizers with differing ``scrub_before_read`` are
+    never merged, so a pre-read (PII) sanitizer is kept distinct from a
+    cassette-only one.
     """
     result: list[BaseSanitizer] = []
     by_key: dict[tuple, int] = {}  # (class, scrub_before_read) -> index in result

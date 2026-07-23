@@ -404,6 +404,36 @@ class TestPreReadAppliedInAppend:
         assert b"REDACTED" in response["body"]["string"]
         # encoding stripped so the component's HTTP stack won't try to gunzip plaintext
         assert "Content-Encoding" not in response["headers"]
+        assert "Bob" not in temp.read_text()
+
+    def test_pre_read_redacts_even_when_request_is_dropped(self, tmp_cassette_dir):
+        from keboola.vcr.sanitizers import BodyFieldSanitizer, CallbackSanitizer
+
+        pii = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
+        dropper = CallbackSanitizer(before_request=lambda r: None)  # drops the interaction
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[pii, dropper])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {"status": {"code": 200, "message": "OK"}, "headers": {}, "body": {"string": b'{"name": "Bob"}'}}
+        r._append_interaction(temp, r._before_record_response, _make_request(), response)
+        # interaction dropped (request filter returned None) but the component-visible
+        # response must still be redacted
+        assert b"Bob" not in response["body"]["string"]
+        assert b"REDACTED" in response["body"]["string"]
+
+    def test_pre_read_applies_sanitizer_that_returns_new_dict(self, tmp_cassette_dir):
+        from keboola.vcr.sanitizers import CallbackSanitizer
+
+        def redact_resp(resp):
+            # honor the return-based contract: return a NEW dict, do not mutate in place
+            return {**resp, "body": {"string": b'{"name": "REDACTED"}'}}
+
+        s = CallbackSanitizer(before_response=redact_resp, scrub_before_read=True)
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {"status": {"code": 200, "message": "OK"}, "headers": {}, "body": {"string": b'{"name": "Bob"}'}}
+        r._append_interaction(temp, r._before_record_response, _make_request(), response)
+        assert b"Bob" not in response["body"]["string"]
+        assert b"REDACTED" in response["body"]["string"]
 
 
 # ---------------------------------------------------------------------------
@@ -442,3 +472,15 @@ class TestRedactedValueGuardrail:
         req = _make_request(uri="https://api.example.com/data?access_token=REALTOKEN123")
         r._append_interaction(temp, r._before_record_response, req, response)  # no raise
         assert "REDACTED" in temp.read_text()
+
+    def test_raises_when_redacted_value_in_request_body(self, tmp_cassette_dir):
+        from keboola.vcr.recorder import VCRRecorderError
+        from keboola.vcr.sanitizers import BodyFieldSanitizer
+
+        s = BodyFieldSanitizer(fields=["cursor"], scrub_before_read=True)
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {"status": {"code": 200, "message": "OK"}, "headers": {}, "body": {"string": b"{}"}}
+        req = _make_request(uri="https://api.example.com/v1/data", body=b'{"cursor": "REDACTED"}')
+        with pytest.raises(VCRRecorderError, match="scrub_before_read"):
+            r._append_interaction(temp, r._before_record_response, req, response)

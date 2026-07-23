@@ -54,6 +54,12 @@ request to succeed. Token/secret sanitizers stay untagged (cassette-only) for
 exactly this reason. If a redacted value is sent to the live API, recording
 aborts with an error telling you which field to untag.
 
+**Caution:** only tag field-scoped body sanitizers (e.g. `BodyFieldSanitizer`)
+with `scrub_before_read`. Do not tag whole-response sanitizers like
+`DefaultSanitizer` or `HeaderSanitizer` — their header whitelisting would also
+apply to the component-visible response during recording, and can strip
+pagination or rate-limit headers the component needs to keep working.
+
 ## Development
 
 ```bash

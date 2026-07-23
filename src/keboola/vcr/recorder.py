@@ -264,9 +264,13 @@ class VCRRecorder:
         # response BEFORE the component reads it (see _append_interaction), in
         # addition to the cassette. The rest stay cassette-only.
         all_sanitizers = self._flatten_sanitizers([default, *(sanitizers or [])])
-        self._pre_read_sanitizers = [s for s in all_sanitizers if getattr(s, "scrub_before_read", False)]
-        self._pre_read_sanitizer = CompositeSanitizer(self._pre_read_sanitizers) if self._pre_read_sanitizers else None
-        self._pre_read_placeholders = {
+        self._pre_read_sanitizers: list[BaseSanitizer] = [
+            s for s in all_sanitizers if getattr(s, "scrub_before_read", False)
+        ]
+        self._pre_read_sanitizer: CompositeSanitizer | None = (
+            CompositeSanitizer(self._pre_read_sanitizers) if self._pre_read_sanitizers else None
+        )
+        self._pre_read_placeholders: set[str] = {
             p for p in (getattr(s, "replacement", "") for s in self._pre_read_sanitizers) if p
         }
 
@@ -776,6 +780,11 @@ class VCRRecorder:
         decoded body/headers back onto the shared ``response`` so the component
         reads decompressed content. Skipped when no Content-Encoding is present,
         which keeps the common uncompressed path allocation-free.
+
+        Note: when a pre-read sanitizer is active, a compressed body is decoded
+        here for the component — and therefore stored decoded in the cassette —
+        even if ``decode_compressed_response=False``, because compressed bytes
+        cannot be scrubbed.
         """
         headers = response.get("headers", {})
         if not any(str(k).lower() == "content-encoding" for k in headers):
@@ -787,14 +796,19 @@ class VCRRecorder:
         response["headers"] = decoded["headers"]
 
     def _apply_pre_read_sanitizers(self, response: dict) -> None:
-        """Redact the shared response in place so the component sees redacted data.
+        """Redact the shared response so the component reads redacted data.
 
         Runs only the scrub_before_read sanitizers (PII), after decompressing the
-        body so they can match. This same dict is handed to the component by
-        vcrpy's VCRHTTPResponse(response) one call after cassette.append.
+        body so they can match. Sanitizers may mutate `response` in place OR return
+        a new dict (the BaseSanitizer contract is return-based), so we write the
+        result back onto the shared dict to cover both — the component reads this
+        exact object via vcrpy's VCRHTTPResponse(response).
         """
         self._decode_response_inplace(response)
-        self._pre_read_sanitizer.before_record_response(response)  # ty: ignore[unresolved-attribute]
+        result = self._pre_read_sanitizer.before_record_response(response)  # ty: ignore[unresolved-attribute]
+        if result is not None and result is not response:
+            response.clear()
+            response.update(result)
 
     def _check_no_redacted_value_sent(self, request: Any) -> None:
         """Fail fast if the component sent a scrub_before_read placeholder to the live API.
@@ -828,20 +842,17 @@ class VCRRecorder:
 
     def _append_interaction(self, temp_path: Path, cassette_before_record_response, request, response) -> None:
         """Serialize a single recorded interaction to the JSONL temp file."""
-        # Fail fast if the component round-tripped a redacted value to the live API.
+        # scrub_before_read must run before the request-filter early-return below:
+        # the component reads the shared `response` dict regardless of whether this
+        # interaction is recorded, so redaction cannot depend on it.
         if self._pre_read_sanitizer is not None:
             self._check_no_redacted_value_sent(request)
+            self._apply_pre_read_sanitizers(response)
 
         # Apply request filter directly — avoids copy.deepcopy inside original_append
         filtered_request = self._before_record_request(request)
         if not filtered_request:
             return
-
-        # scrub_before_read: redact the shared response IN PLACE so the component,
-        # which reads this same dict via VCRHTTPResponse(response), sees the
-        # redacted data. Gated on a pre-read sanitizer being configured.
-        if self._pre_read_sanitizer is not None:
-            self._apply_pre_read_sanitizers(response)
 
         # Shallow copy prevents the cassette-only sanitizers from mutating the
         # response dict the component reads. The bytes object referenced by
