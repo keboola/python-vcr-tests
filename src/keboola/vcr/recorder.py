@@ -769,6 +769,33 @@ class VCRRecorder:
                     f"The component behaviour has changed since the cassette was recorded."
                 )
 
+    def _decode_response_inplace(self, response: dict) -> None:
+        """Decompress the response body in place, but only when encoded.
+
+        vcrpy's decode_response deep-copies and returns a new dict; we copy the
+        decoded body/headers back onto the shared ``response`` so the component
+        reads decompressed content. Skipped when no Content-Encoding is present,
+        which keeps the common uncompressed path allocation-free.
+        """
+        headers = response.get("headers", {})
+        if not any(str(k).lower() == "content-encoding" for k in headers):
+            return
+        from vcr.filters import decode_response
+
+        decoded = decode_response(response)
+        response["body"] = decoded["body"]
+        response["headers"] = decoded["headers"]
+
+    def _apply_pre_read_sanitizers(self, response: dict) -> None:
+        """Redact the shared response in place so the component sees redacted data.
+
+        Runs only the scrub_before_read sanitizers (PII), after decompressing the
+        body so they can match. This same dict is handed to the component by
+        vcrpy's VCRHTTPResponse(response) one call after cassette.append.
+        """
+        self._decode_response_inplace(response)
+        self._pre_read_sanitizer.before_record_response(response)  # ty: ignore[unresolved-attribute]
+
     def _append_interaction(self, temp_path: Path, cassette_before_record_response, request, response) -> None:
         """Serialize a single recorded interaction to the JSONL temp file."""
         # Apply request filter directly — avoids copy.deepcopy inside original_append
@@ -776,9 +803,15 @@ class VCRRecorder:
         if not filtered_request:
             return
 
-        # Shallow copy prevents our sanitizer from mutating the response dict
-        # that VCRHTTPResponse will return to the component.  The bytes object
-        # referenced by body["string"] is immutable, so sharing it is safe.
+        # scrub_before_read: redact the shared response IN PLACE so the component,
+        # which reads this same dict via VCRHTTPResponse(response), sees the
+        # redacted data. Gated on a pre-read sanitizer being configured.
+        if self._pre_read_sanitizer is not None:
+            self._apply_pre_read_sanitizers(response)
+
+        # Shallow copy prevents the cassette-only sanitizers from mutating the
+        # response dict the component reads. The bytes object referenced by
+        # body["string"] is immutable, so sharing it is safe.
         response_copy = {
             **response,
             "body": {**response.get("body", {})},

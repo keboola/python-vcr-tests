@@ -315,3 +315,92 @@ class TestPreReadPartition:
         s = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
         r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[CompositeSanitizer([s])])
         assert r._pre_read_sanitizer is not None
+
+
+# ---------------------------------------------------------------------------
+# VCRRecorder pre-read sanitizers applied in _append_interaction
+# ---------------------------------------------------------------------------
+
+
+def _make_request(uri="https://api.example.com/v1/customers", body=None):
+    from types import SimpleNamespace
+
+    req = SimpleNamespace(uri=uri, method="GET", headers={"Content-Type": "application/json"}, body=body)
+    req._to_dict = lambda: {"uri": req.uri, "method": req.method, "headers": dict(req.headers), "body": req.body}
+    return req
+
+
+class TestPreReadAppliedInAppend:
+    def test_component_visible_response_is_redacted(self, tmp_cassette_dir):
+        from keboola.vcr.sanitizers import BodyFieldSanitizer
+
+        s = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {
+            "status": {"code": 200, "message": "OK"},
+            "headers": {"Content-Type": ["application/json"]},
+            "body": {"string": b'{"name": "Bob", "id": 7}'},
+        }
+        r._append_interaction(temp, r._before_record_response, _make_request(), response)
+        # the component reads this exact dict via VCRHTTPResponse -> must be redacted
+        assert b"Bob" not in response["body"]["string"]
+        assert b"REDACTED" in response["body"]["string"]
+        assert b'"id": 7' in response["body"]["string"]  # untagged field preserved
+        # cassette line is redacted too
+        line = temp.read_text()
+        assert "Bob" not in line and "REDACTED" in line
+
+    def test_no_tag_leaves_component_response_untouched(self, tmp_cassette_dir):
+        from keboola.vcr.sanitizers import BodyFieldSanitizer
+
+        s = BodyFieldSanitizer(fields=["name"])  # NOT tagged -> cassette-only
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {
+            "status": {"code": 200, "message": "OK"},
+            "headers": {},
+            "body": {"string": b'{"name": "Bob"}'},
+        }
+        r._append_interaction(temp, r._before_record_response, _make_request(), response)
+        assert response["body"]["string"] == b'{"name": "Bob"}'  # untouched for component
+        assert "REDACTED" in temp.read_text()  # cassette still sanitized
+
+    def test_untagged_token_stays_real_for_component_but_redacted_in_cassette(self, tmp_cassette_dir):
+        from keboola.vcr.sanitizers import BodyFieldSanitizer, TokenSanitizer
+
+        pii = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
+        tok = TokenSanitizer(tokens=["SECRET_TOKEN"])  # untagged -> cassette-only
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[pii, tok])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {
+            "status": {"code": 200, "message": "OK"},
+            "headers": {},
+            "body": {"string": b'{"name": "Bob", "access_token": "SECRET_TOKEN"}'},
+        }
+        r._append_interaction(temp, r._before_record_response, _make_request(), response)
+        # component: PII redacted, token REAL (needed for follow-up live calls)
+        assert b"Bob" not in response["body"]["string"]
+        assert b"SECRET_TOKEN" in response["body"]["string"]
+        # cassette: both redacted
+        line = temp.read_text()
+        assert "SECRET_TOKEN" not in line
+        assert "Bob" not in line
+
+    def test_gzip_body_decoded_and_redacted_for_component(self, tmp_cassette_dir):
+        import gzip
+
+        from keboola.vcr.sanitizers import BodyFieldSanitizer
+
+        s = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {
+            "status": {"code": 200, "message": "OK"},
+            "headers": {"Content-Encoding": ["gzip"]},
+            "body": {"string": gzip.compress(b'{"name": "Bob"}')},
+        }
+        r._append_interaction(temp, r._before_record_response, _make_request(), response)
+        assert b"REDACTED" in response["body"]["string"]
+        # encoding stripped so the component's HTTP stack won't try to gunzip plaintext
+        assert "Content-Encoding" not in response["headers"]
