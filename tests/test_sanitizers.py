@@ -313,6 +313,22 @@ class TestBodyFieldSanitizer:
         data = json.loads(result.body)
         assert data["access_token"] == "REDACTED"
 
+    def test_sanitizes_top_level_json_array_body(self):
+        # Regression: endpoints returning a bare JSON array must not crash
+        # (_sanitize_dict on a list raised AttributeError: 'list' object has no
+        # attribute 'items'); fields inside the array's objects must be redacted.
+        s = BodyFieldSanitizer(fields=["name"])
+        body = '[{"name": "Bob", "id": 1}, {"name": "Alice", "id": 2}]'
+        result = s._sanitize_body(body)
+        assert json.loads(result) == [{"name": "REDACTED", "id": 1}, {"name": "REDACTED", "id": 2}]
+
+    def test_response_body_top_level_array_does_not_crash(self):
+        s = BodyFieldSanitizer(fields=["name"])
+        response = {"body": {"string": b'[{"name": "Bob"}]'}}
+        result = s.before_record_response(response)
+        assert b"Bob" not in result["body"]["string"]
+        assert b"REDACTED" in result["body"]["string"]
+
 
 # ---------------------------------------------------------------------------
 # QueryParamSanitizer

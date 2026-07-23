@@ -522,34 +522,43 @@ class BodyFieldSanitizer(BaseSanitizer):
         self.nested = nested
         self.scrub_before_read = scrub_before_read
 
+    def _sanitize_value(self, value: Any) -> Any:
+        """Recursively sanitize any JSON value (dict, list, or scalar).
+
+        Handles a top-level list as well as nested lists/dicts, so a response
+        body that is a bare JSON array (common for list endpoints) is sanitized
+        instead of raising ``AttributeError`` from ``dict.items()``.
+        """
+        if isinstance(value, dict):
+            return self._sanitize_dict(value)
+        if isinstance(value, list):
+            return [self._sanitize_value(item) for item in value]
+        return value
+
     def _sanitize_dict(self, d: dict) -> dict:
         """Sanitize specified fields in a dictionary."""
         result = {}
         for key, value in d.items():
             if key in self.fields:
                 result[key] = self.replacement
-            elif self.nested and isinstance(value, dict):
-                result[key] = self._sanitize_dict(value)
-            elif self.nested and isinstance(value, list):
-                result[key] = [self._sanitize_dict(item) if isinstance(item, dict) else item for item in value]
+            elif self.nested:
+                result[key] = self._sanitize_value(value)
             else:
                 result[key] = value
         return result
 
     def _sanitize_body(self, body: Any) -> Any:
-        """Parse and sanitize JSON body."""
+        """Parse and sanitize a JSON body (object or top-level array)."""
         if not body:
             return body
 
         try:
             if isinstance(body, bytes):
                 data = json.loads(body.decode("utf-8"))
-                sanitized = self._sanitize_dict(data)
-                return json.dumps(sanitized).encode("utf-8")
+                return json.dumps(self._sanitize_value(data)).encode("utf-8")
             elif isinstance(body, str):
                 data = json.loads(body)
-                sanitized = self._sanitize_dict(data)
-                return json.dumps(sanitized)
+                return json.dumps(self._sanitize_value(data))
         except (json.JSONDecodeError, UnicodeDecodeError):
             pass
 
