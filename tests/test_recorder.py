@@ -288,3 +288,30 @@ class TestVCRRecorderLoadSecretsFile:
         f.write_text("{not valid json}")
         with pytest.raises(SecretsLoadError):
             VCRRecorder._load_secrets_file(f)
+
+
+# ---------------------------------------------------------------------------
+# VCRRecorder pre-read sanitizer partition
+# ---------------------------------------------------------------------------
+
+
+class TestPreReadPartition:
+    def test_no_tagged_sanitizer_means_none(self, tmp_cassette_dir):
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[DefaultSanitizer()])
+        assert r._pre_read_sanitizer is None
+        assert r._pre_read_placeholders == set()
+
+    def test_tagged_sanitizer_detected(self, tmp_cassette_dir):
+        from keboola.vcr.sanitizers import BodyFieldSanitizer
+
+        s = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        assert r._pre_read_sanitizer is not None
+        assert "REDACTED" in r._pre_read_placeholders
+
+    def test_tagged_inside_composite_is_flattened(self, tmp_cassette_dir):
+        from keboola.vcr.sanitizers import BodyFieldSanitizer, CompositeSanitizer
+
+        s = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[CompositeSanitizer([s])])
+        assert r._pre_read_sanitizer is not None

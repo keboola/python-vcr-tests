@@ -260,6 +260,16 @@ class VCRRecorder:
         else:
             self.sanitizer = default
 
+        # Partition: sanitizers tagged scrub_before_read=True are applied to the
+        # response BEFORE the component reads it (see _append_interaction), in
+        # addition to the cassette. The rest stay cassette-only.
+        all_sanitizers = self._flatten_sanitizers([default, *(sanitizers or [])])
+        self._pre_read_sanitizers = [s for s in all_sanitizers if getattr(s, "scrub_before_read", False)]
+        self._pre_read_sanitizer = CompositeSanitizer(self._pre_read_sanitizers) if self._pre_read_sanitizers else None
+        self._pre_read_placeholders = {
+            p for p in (getattr(s, "replacement", "") for s in self._pre_read_sanitizers) if p
+        }
+
         # Response sanitization is skipped during replay — cassettes already
         # contain sanitized data from when they were recorded.  Only request
         # sanitization runs during replay (needed for matching).
@@ -874,6 +884,17 @@ class VCRRecorder:
         my_vcr.register_serializer("json", JsonIndentedSerializer())
 
         return my_vcr
+
+    @staticmethod
+    def _flatten_sanitizers(sanitizers: list[BaseSanitizer]) -> list[BaseSanitizer]:
+        """Flatten nested CompositeSanitizers into a flat list of leaf sanitizers."""
+        flat: list[BaseSanitizer] = []
+        for s in sanitizers:
+            if isinstance(s, CompositeSanitizer):
+                flat.extend(VCRRecorder._flatten_sanitizers(s.sanitizers))
+            else:
+                flat.append(s)
+        return flat
 
     @staticmethod
     def _load_custom_sanitizers(test_data_dir: Path) -> list[BaseSanitizer] | None:
