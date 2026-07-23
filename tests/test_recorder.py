@@ -404,3 +404,41 @@ class TestPreReadAppliedInAppend:
         assert b"REDACTED" in response["body"]["string"]
         # encoding stripped so the component's HTTP stack won't try to gunzip plaintext
         assert "Content-Encoding" not in response["headers"]
+
+
+# ---------------------------------------------------------------------------
+# Fail-fast guardrail: redacted value round-tripped into a live request
+# ---------------------------------------------------------------------------
+
+
+class TestRedactedValueGuardrail:
+    def test_raises_when_redacted_value_sent_to_live_api(self, tmp_cassette_dir):
+        from keboola.vcr.recorder import VCRRecorderError
+        from keboola.vcr.sanitizers import BodyFieldSanitizer
+
+        s = BodyFieldSanitizer(fields=["cursor"], scrub_before_read=True)
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {"status": {"code": 200, "message": "OK"}, "headers": {}, "body": {"string": b"{}"}}
+        req = _make_request(uri="https://api.example.com/v1/data?cursor=REDACTED")
+        with pytest.raises(VCRRecorderError, match="scrub_before_read"):
+            r._append_interaction(temp, r._before_record_response, req, response)
+
+    def test_no_raise_without_tagged_sanitizer(self, tmp_cassette_dir):
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[DefaultSanitizer()])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {"status": {"code": 200, "message": "OK"}, "headers": {}, "body": {"string": b"{}"}}
+        req = _make_request(uri="https://api.example.com/data?cursor=REDACTED")
+        r._append_interaction(temp, r._before_record_response, req, response)  # no raise
+        assert temp.exists()
+
+    def test_no_false_positive_on_real_token_in_request(self, tmp_cassette_dir):
+        from keboola.vcr.sanitizers import BodyFieldSanitizer
+
+        s = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {"status": {"code": 200, "message": "OK"}, "headers": {}, "body": {"string": b'{"name": "Bob"}'}}
+        req = _make_request(uri="https://api.example.com/data?access_token=REALTOKEN123")
+        r._append_interaction(temp, r._before_record_response, req, response)  # no raise
+        assert "REDACTED" in temp.read_text()

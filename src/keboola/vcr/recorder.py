@@ -796,8 +796,42 @@ class VCRRecorder:
         self._decode_response_inplace(response)
         self._pre_read_sanitizer.before_record_response(response)  # ty: ignore[unresolved-attribute]
 
+    def _check_no_redacted_value_sent(self, request: Any) -> None:
+        """Fail fast if the component sent a scrub_before_read placeholder to the live API.
+
+        A placeholder in an outgoing request means a tagged sanitizer redacted a
+        value the component round-trips (a cursor, ID, or token) — which breaks
+        the live follow-up call. Checked on the raw request (before request
+        sanitization) so a legitimately redacted request field is not a false hit.
+        """
+        if not self._pre_read_placeholders:
+            return
+        parts: list[str] = []
+        uri = getattr(request, "uri", None)
+        if isinstance(uri, str):
+            parts.append(uri)
+        body = getattr(request, "body", None)
+        if isinstance(body, bytes):
+            parts.append(body.decode("utf-8", errors="ignore"))
+        elif isinstance(body, str):
+            parts.append(body)
+        haystack = "\n".join(parts)
+        for placeholder in self._pre_read_placeholders:
+            if placeholder and placeholder in haystack:
+                raise VCRRecorderError(
+                    f"A scrub_before_read sanitizer redacted a value that the component "
+                    f"sent back to the live API (found placeholder {placeholder!r} in an "
+                    f"outgoing request). This usually means a tagged field is round-tripped "
+                    f"by the component — a pagination cursor, ID, or token. Remove that field "
+                    f"from scrub_before_read so it stays real during recording."
+                )
+
     def _append_interaction(self, temp_path: Path, cassette_before_record_response, request, response) -> None:
         """Serialize a single recorded interaction to the JSONL temp file."""
+        # Fail fast if the component round-tripped a redacted value to the live API.
+        if self._pre_read_sanitizer is not None:
+            self._check_no_redacted_value_sent(request)
+
         # Apply request filter directly — avoids copy.deepcopy inside original_append
         filtered_request = self._before_record_request(request)
         if not filtered_request:
