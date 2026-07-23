@@ -16,6 +16,7 @@ from keboola.vcr.sanitizers import (
     ResponseUrlSanitizer,
     TokenSanitizer,
     UrlPatternSanitizer,
+    _dedup_sanitizers,
     create_default_sanitizer,
     extract_values,
 )
@@ -485,3 +486,36 @@ class TestCreateDefaultSanitizer:
         s = create_default_sanitizer({})
         assert isinstance(s, DefaultSanitizer)
         assert s.sensitive_values == []
+
+
+# ---------------------------------------------------------------------------
+# scrub_before_read flag
+# ---------------------------------------------------------------------------
+
+
+class TestScrubBeforeReadFlag:
+    def test_defaults_false(self):
+        assert DefaultSanitizer().scrub_before_read is False
+        assert BodyFieldSanitizer(fields=["x"]).scrub_before_read is False
+
+    def test_flag_set_true(self):
+        s = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
+        assert s.scrub_before_read is True
+
+    def test_merge_preserves_flag(self):
+        a = DefaultSanitizer(additional_sensitive_fields=["a"], scrub_before_read=True)
+        b = DefaultSanitizer(additional_sensitive_fields=["b"], scrub_before_read=True)
+        assert a.merge(b).scrub_before_read is True
+
+    def test_dedup_keeps_different_flag_values_separate(self):
+        tagged = DefaultSanitizer(additional_sensitive_fields=["pii"], scrub_before_read=True)
+        cassette_only = DefaultSanitizer(additional_sensitive_fields=["tok"])
+        result = _dedup_sanitizers([tagged, cassette_only])
+        assert len(result) == 2
+
+    def test_dedup_merges_same_flag_values(self):
+        a = DefaultSanitizer(additional_sensitive_fields=["a"], scrub_before_read=True)
+        b = DefaultSanitizer(additional_sensitive_fields=["b"], scrub_before_read=True)
+        result = _dedup_sanitizers([a, b])
+        assert len(result) == 1
+        assert result[0].scrub_before_read is True
