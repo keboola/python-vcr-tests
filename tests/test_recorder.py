@@ -145,9 +145,7 @@ class TestZeroCopyVCRResponseInit:
     def test_forwards_811_single_positional(self):
         resp = _FakeVCRResponse()
         recorded = {"body": {"string": b"payload"}}
-        _zero_copy_vcr_response_init(
-            resp, recorded, original_init=_FakeVCRResponse._811_init
-        )
+        _zero_copy_vcr_response_init(resp, recorded, original_init=_FakeVCRResponse._811_init)
         assert isinstance(resp._content, _VCRRecordingReader)
         assert resp._content.read() == b"payload"
 
