@@ -85,12 +85,12 @@ step 1). Rationale:
 - `is_connected` and `release_conn` are still **not** native in 8.3.0, so our
   `hasattr`-guarded connection-reuse / OOM patches remain necessary and
   compatible.
-- **Relevant upstream change:** stock `Cassette.append` now does
+- **Relevant upstream behaviour:** stock `Cassette.append` does
   `response = copy.deepcopy(response)` (*"mutation of `response` will corrupt the
-  real response"*) — upstream implementing the same response↔client isolation our
-  `_append_interaction` does by hand. It is **not** a native "sanitize before the
-  client reads" hook (it does the opposite), so our `append` override is still
-  required. Keeping the override also avoids the stock `deepcopy`, which is the
+  real response"*) — the same response↔client isolation our `_append_interaction`
+  does by hand (present since at least 8.1.1, unchanged in 8.3.0). It is **not** a
+  native "sanitize before the client reads" hook (it does the opposite), so our
+  `append` override is still required. Keeping the override also avoids the stock `deepcopy`, which is the
   full-body memory spike our shallow-copy path was built to prevent, and is what
   lets us implement `scrub_before_read` in the first place.
 
