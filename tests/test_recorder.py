@@ -484,3 +484,30 @@ class TestRedactedValueGuardrail:
         req = _make_request(uri="https://api.example.com/v1/data", body=b'{"cursor": "REDACTED"}')
         with pytest.raises(VCRRecorderError, match="scrub_before_read"):
             r._append_interaction(temp, r._before_record_response, req, response)
+
+    def test_no_false_positive_on_common_placeholder_in_url(self, tmp_cassette_dir):
+        # A tagged sanitizer whose replacement is the common word "token"
+        # (QueryParamSanitizer's default) must NOT abort on ordinary OAuth URLs
+        # where "token" appears only in a key or path segment, not as a value.
+        from keboola.vcr.sanitizers import QueryParamSanitizer
+
+        s = QueryParamSanitizer(scrub_before_read=True)  # replacement defaults to "token"
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        assert "token" in r._pre_read_placeholders  # guard the premise
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {"status": {"code": 200, "message": "OK"}, "headers": {}, "body": {"string": b"{}"}}
+        req = _make_request(uri="https://api.example.com/oauth/token?access_token=REALVALUE&grant_type=refresh_token")
+        r._append_interaction(temp, r._before_record_response, req, response)  # must not raise
+        assert temp.exists()
+
+    def test_error_names_tagged_sanitizer(self, tmp_cassette_dir):
+        from keboola.vcr.recorder import VCRRecorderError
+        from keboola.vcr.sanitizers import BodyFieldSanitizer
+
+        s = BodyFieldSanitizer(fields=["cursor"], scrub_before_read=True)
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, sanitizers=[s])
+        temp = tmp_cassette_dir / "t.jsonl"
+        response = {"status": {"code": 200, "message": "OK"}, "headers": {}, "body": {"string": b"{}"}}
+        req = _make_request(uri="https://api.example.com/v1/data?cursor=REDACTED")
+        with pytest.raises(VCRRecorderError, match="BodyFieldSanitizer"):
+            r._append_interaction(temp, r._before_record_response, req, response)

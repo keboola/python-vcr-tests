@@ -52,7 +52,8 @@ the component sends back to the live API during recording — a pagination curso
 an async job ID, or an OAuth token — because it must stay real for the follow-up
 request to succeed. Token/secret sanitizers stay untagged (cassette-only) for
 exactly this reason. If a redacted value is sent to the live API, recording
-aborts with an error telling you which field to untag.
+aborts with an error naming the tagged sanitizer(s) so you can find and untag
+the offending field.
 
 **Caution:** only tag field-scoped body sanitizers (e.g. `BodyFieldSanitizer`)
 with `scrub_before_read`. Do not tag whole-response sanitizers like

@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -831,13 +832,23 @@ class VCRRecorder:
             parts.append(body)
         haystack = "\n".join(parts)
         for placeholder in self._pre_read_placeholders:
-            if placeholder and placeholder in haystack:
+            if not placeholder:
+                continue
+            esc = re.escape(placeholder)
+            # Match the placeholder only where a *value* sits — a query/form value
+            # (`=PLACEHOLDER`) or a quoted/JSON value (`"PLACEHOLDER"`). A bare
+            # substring test would false-fire on common placeholders: e.g. a
+            # "token" placeholder matching `access_token=` or `/oauth/token` in an
+            # ordinary URL, aborting a valid recording.
+            if re.search(rf"=\s*{esc}(?=[&\s\"']|$)", haystack) or re.search(rf'"{esc}"', haystack):
+                tagged = ", ".join(sorted({type(s).__name__ for s in self._pre_read_sanitizers}))
                 raise VCRRecorderError(
                     f"A scrub_before_read sanitizer redacted a value that the component "
-                    f"sent back to the live API (found placeholder {placeholder!r} in an "
-                    f"outgoing request). This usually means a tagged field is round-tripped "
-                    f"by the component — a pagination cursor, ID, or token. Remove that field "
-                    f"from scrub_before_read so it stays real during recording."
+                    f"sent back to the live API (found placeholder {placeholder!r} as a value "
+                    f"in an outgoing request). This usually means a tagged field is round-tripped "
+                    f"by the component — a pagination cursor, ID, or token. Check your "
+                    f"scrub_before_read sanitizer(s) [{tagged}] and remove the round-tripped "
+                    f"field so it stays real during recording."
                 )
 
     def _append_interaction(self, temp_path: Path, cassette_before_record_response, request, response) -> None:
