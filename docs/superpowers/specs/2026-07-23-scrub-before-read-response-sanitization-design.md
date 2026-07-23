@@ -62,6 +62,38 @@ construction.
 - **CF Claude Kit documentation** (telling component authors this exists and how
   to use it) is a **separate follow-up PR** after this lands.
 
+## vcrpy dependency & compatibility
+
+Bump the pin from `vcrpy>=8.1.1,<9` to **`vcrpy>=8.3.0,<9`** (implementation
+step 1). Rationale:
+
+- 8.3.0 (2026-07-04) is the latest release. 8.2.1 carries a security fix — the
+  cassette YAML loader is now safe against arbitrary code execution
+  (GHSA-rpj2-4hq8-938g) — which alone justifies raising the floor.
+- We still depend on vcrpy private API (`cassette.append`, `cassette._save`,
+  `cassette._before_record_response`); the `<9` cap stays until 9.x is vetted.
+
+**Verified against 8.3.0** (ephemeral install, no lockfile change yet):
+
+- All **182 existing tests pass** on 8.3.0.
+- The recording data-flow our design depends on is intact: `getresponse()` still
+  calls `cassette.append(request, response)` and then
+  `VCRHTTPResponse(response, uri)` **on the same `response` dict** — so mutating
+  it in our `append` override still reaches the component.
+- `VCRHTTPResponse.__init__` is now `(recorded_response, request_url=None)`; our
+  `_zero_copy_vcr_response_init` already forwards `*args`, so it is compatible.
+- `is_connected` and `release_conn` are still **not** native in 8.3.0, so our
+  `hasattr`-guarded connection-reuse / OOM patches remain necessary and
+  compatible.
+- **Relevant upstream change:** stock `Cassette.append` now does
+  `response = copy.deepcopy(response)` (*"mutation of `response` will corrupt the
+  real response"*) — upstream implementing the same response↔client isolation our
+  `_append_interaction` does by hand. It is **not** a native "sanitize before the
+  client reads" hook (it does the opposite), so our `append` override is still
+  required. Keeping the override also avoids the stock `deepcopy`, which is the
+  full-body memory spike our shallow-copy path was built to prevent, and is what
+  lets us implement `scrub_before_read` in the first place.
+
 ## Approaches considered
 
 | Approach | Verdict |
@@ -228,6 +260,8 @@ clear diagnosis. The check runs only when the pre-read view is non-empty.
   `DefaultSanitizer` → they are not merged; the partition is preserved.
 - **Two-call integration:** a token call + a data call, token sanitizer untagged,
   PII sanitizer tagged → recording completes and the data-call output is redacted.
+- **Dependency floor:** the full suite runs green against the pinned vcrpy floor
+  (8.3.0). Already confirmed for the pre-feature suite; must stay green after.
 
 ## Follow-ups (out of scope for this PR)
 
