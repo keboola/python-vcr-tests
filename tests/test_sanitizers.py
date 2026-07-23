@@ -16,6 +16,7 @@ from keboola.vcr.sanitizers import (
     ResponseUrlSanitizer,
     TokenSanitizer,
     UrlPatternSanitizer,
+    _dedup_sanitizers,
     create_default_sanitizer,
     extract_values,
 )
@@ -312,6 +313,22 @@ class TestBodyFieldSanitizer:
         data = json.loads(result.body)
         assert data["access_token"] == "REDACTED"
 
+    def test_sanitizes_top_level_json_array_body(self):
+        # Regression: endpoints returning a bare JSON array must not crash
+        # (_sanitize_dict on a list raised AttributeError: 'list' object has no
+        # attribute 'items'); fields inside the array's objects must be redacted.
+        s = BodyFieldSanitizer(fields=["name"])
+        body = '[{"name": "Bob", "id": 1}, {"name": "Alice", "id": 2}]'
+        result = s._sanitize_body(body)
+        assert json.loads(result) == [{"name": "REDACTED", "id": 1}, {"name": "REDACTED", "id": 2}]
+
+    def test_response_body_top_level_array_does_not_crash(self):
+        s = BodyFieldSanitizer(fields=["name"])
+        response = {"body": {"string": b'[{"name": "Bob"}]'}}
+        result = s.before_record_response(response)
+        assert b"Bob" not in result["body"]["string"]
+        assert b"REDACTED" in result["body"]["string"]
+
 
 # ---------------------------------------------------------------------------
 # QueryParamSanitizer
@@ -485,3 +502,36 @@ class TestCreateDefaultSanitizer:
         s = create_default_sanitizer({})
         assert isinstance(s, DefaultSanitizer)
         assert s.sensitive_values == []
+
+
+# ---------------------------------------------------------------------------
+# scrub_before_read flag
+# ---------------------------------------------------------------------------
+
+
+class TestScrubBeforeReadFlag:
+    def test_defaults_false(self):
+        assert DefaultSanitizer().scrub_before_read is False
+        assert BodyFieldSanitizer(fields=["x"]).scrub_before_read is False
+
+    def test_flag_set_true(self):
+        s = BodyFieldSanitizer(fields=["name"], scrub_before_read=True)
+        assert s.scrub_before_read is True
+
+    def test_merge_preserves_flag(self):
+        a = DefaultSanitizer(additional_sensitive_fields=["a"], scrub_before_read=True)
+        b = DefaultSanitizer(additional_sensitive_fields=["b"], scrub_before_read=True)
+        assert a.merge(b).scrub_before_read is True
+
+    def test_dedup_keeps_different_flag_values_separate(self):
+        tagged = DefaultSanitizer(additional_sensitive_fields=["pii"], scrub_before_read=True)
+        cassette_only = DefaultSanitizer(additional_sensitive_fields=["tok"])
+        result = _dedup_sanitizers([tagged, cassette_only])
+        assert len(result) == 2
+
+    def test_dedup_merges_same_flag_values(self):
+        a = DefaultSanitizer(additional_sensitive_fields=["a"], scrub_before_read=True)
+        b = DefaultSanitizer(additional_sensitive_fields=["b"], scrub_before_read=True)
+        result = _dedup_sanitizers([a, b])
+        assert len(result) == 1
+        assert result[0].scrub_before_read is True

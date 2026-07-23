@@ -22,6 +22,10 @@ class BaseSanitizer(ABC):
     requests and responses before they are recorded to cassettes.
     """
 
+    # When True, the recorder applies this sanitizer to the response BEFORE the
+    # component reads it (and to the cassette). Default False = cassette-only.
+    scrub_before_read: bool = False
+
     def before_record_request(self, request: Any) -> Any:
         """
         Sanitize request before recording. Override in subclass.
@@ -95,6 +99,7 @@ class DefaultSanitizer(BaseSanitizer):
         additional_safe_headers: list[str] | None = None,
         replacement: str = "REDACTED",
         config: dict[str, Any] | None = None,
+        scrub_before_read: bool = False,
     ):
         # Build sensitive fields set
         if sensitive_fields is not None:
@@ -126,6 +131,7 @@ class DefaultSanitizer(BaseSanitizer):
         self.replacement = replacement
         # Pre-compile regex for form-encoded/query param matching
         self._field_patterns = [re.compile(rf"({re.escape(f)}=)[^&\"\s]+") for f in self.sensitive_fields]
+        self.scrub_before_read = scrub_before_read
 
     # -- Core function 1: URL sanitization --
 
@@ -235,6 +241,7 @@ class DefaultSanitizer(BaseSanitizer):
             safe_headers=list(self.safe_headers | other.safe_headers),
             sensitive_values=merged_values,
             replacement=self.replacement,
+            scrub_before_read=self.scrub_before_read,
         )
 
     # -- Applied uniformly to requests and responses --
@@ -308,7 +315,7 @@ class TokenSanitizer(BaseSanitizer):
     tokens and replaces them with the replacement string.
     """
 
-    def __init__(self, tokens: list[str], replacement: str = "REDACTED"):
+    def __init__(self, tokens: list[str], replacement: str = "REDACTED", scrub_before_read: bool = False):
         """
         Args:
             tokens: List of token values to sanitize
@@ -316,12 +323,14 @@ class TokenSanitizer(BaseSanitizer):
         """
         self.tokens = [t for t in tokens if t]  # Filter out empty strings
         self.replacement = replacement
+        self.scrub_before_read = scrub_before_read
 
     def merge(self, other: TokenSanitizer) -> TokenSanitizer:
         """Merge two TokenSanitizers into one, unioning their token lists."""
         return TokenSanitizer(
             tokens=list(dict.fromkeys(self.tokens + other.tokens)),
             replacement=self.replacement,
+            scrub_before_read=self.scrub_before_read,
         )
 
     def _sanitize_string(self, value: str) -> str:
@@ -437,6 +446,7 @@ class HeaderSanitizer(BaseSanitizer):
         safe_headers: list[str] | None = None,
         additional_safe_headers: list[str] | None = None,
         headers_to_remove: list[str] | None = None,
+        scrub_before_read: bool = False,
     ):
         """
         Args:
@@ -452,12 +462,14 @@ class HeaderSanitizer(BaseSanitizer):
                 self.safe_headers.update(h.lower() for h in additional_safe_headers)
 
         self.headers_to_remove = set(h.lower() for h in (headers_to_remove or []))
+        self.scrub_before_read = scrub_before_read
 
     def merge(self, other: HeaderSanitizer) -> HeaderSanitizer:
         """Merge two HeaderSanitizers into one, unioning their header sets."""
         return HeaderSanitizer(
             safe_headers=list(self.safe_headers | other.safe_headers),
             headers_to_remove=list(self.headers_to_remove | other.headers_to_remove),
+            scrub_before_read=self.scrub_before_read,
         )
 
     def _filter_headers(self, headers: dict) -> dict:
@@ -497,6 +509,7 @@ class BodyFieldSanitizer(BaseSanitizer):
         fields: list[str],
         replacement: str = "REDACTED",
         nested: bool = True,
+        scrub_before_read: bool = False,
     ):
         """
         Args:
@@ -507,6 +520,20 @@ class BodyFieldSanitizer(BaseSanitizer):
         self.fields = set(fields)
         self.replacement = replacement
         self.nested = nested
+        self.scrub_before_read = scrub_before_read
+
+    def _sanitize_value(self, value: Any) -> Any:
+        """Recursively sanitize any JSON value (dict, list, or scalar).
+
+        Handles a top-level list as well as nested lists/dicts, so a response
+        body that is a bare JSON array (common for list endpoints) is sanitized
+        instead of raising ``AttributeError`` from ``dict.items()``.
+        """
+        if isinstance(value, dict):
+            return self._sanitize_dict(value)
+        if isinstance(value, list):
+            return [self._sanitize_value(item) for item in value]
+        return value
 
     def _sanitize_dict(self, d: dict) -> dict:
         """Sanitize specified fields in a dictionary."""
@@ -514,28 +541,24 @@ class BodyFieldSanitizer(BaseSanitizer):
         for key, value in d.items():
             if key in self.fields:
                 result[key] = self.replacement
-            elif self.nested and isinstance(value, dict):
-                result[key] = self._sanitize_dict(value)
-            elif self.nested and isinstance(value, list):
-                result[key] = [self._sanitize_dict(item) if isinstance(item, dict) else item for item in value]
+            elif self.nested:
+                result[key] = self._sanitize_value(value)
             else:
                 result[key] = value
         return result
 
     def _sanitize_body(self, body: Any) -> Any:
-        """Parse and sanitize JSON body."""
+        """Parse and sanitize a JSON body (object or top-level array)."""
         if not body:
             return body
 
         try:
             if isinstance(body, bytes):
                 data = json.loads(body.decode("utf-8"))
-                sanitized = self._sanitize_dict(data)
-                return json.dumps(sanitized).encode("utf-8")
+                return json.dumps(self._sanitize_value(data)).encode("utf-8")
             elif isinstance(body, str):
                 data = json.loads(body)
-                sanitized = self._sanitize_dict(data)
-                return json.dumps(sanitized)
+                return json.dumps(self._sanitize_value(data))
         except (json.JSONDecodeError, UnicodeDecodeError):
             pass
 
@@ -572,17 +595,24 @@ class QueryParamSanitizer(BaseSanitizer):
         # "...?access_token=EAACh5tPbZAJEB..." -> "...?access_token=token..."
     """
 
-    def __init__(self, parameters: list[str] | None = None, replacement: str = "token"):
+    def __init__(
+        self,
+        parameters: list[str] | None = None,
+        replacement: str = "token",
+        scrub_before_read: bool = False,
+    ):
         self.parameters = parameters or ["access_token"]
         self.replacement = replacement
         # Build regex patterns for each parameter
         self._patterns = [re.compile(rf"({re.escape(param)}=)[^&\"\s]+") for param in self.parameters]
+        self.scrub_before_read = scrub_before_read
 
     def merge(self, other: QueryParamSanitizer) -> QueryParamSanitizer:
         """Merge two QueryParamSanitizers into one, unioning their parameter lists."""
         return QueryParamSanitizer(
             parameters=list(dict.fromkeys(self.parameters + other.parameters)),
             replacement=self.replacement,
+            scrub_before_read=self.scrub_before_read,
         )
 
     def _sanitize_string(self, value: str) -> str:
@@ -618,7 +648,7 @@ class UrlPatternSanitizer(BaseSanitizer):
     sensitive data embedded in URLs.
     """
 
-    def __init__(self, patterns: list[tuple]):
+    def __init__(self, patterns: list[tuple], scrub_before_read: bool = False):
         """
         Args:
             patterns: List of (pattern, replacement) tuples.
@@ -627,6 +657,7 @@ class UrlPatternSanitizer(BaseSanitizer):
         """
         self._raw_patterns = patterns  # stored for merge()
         self.patterns = [(re.compile(p), r) for p, r in patterns]
+        self.scrub_before_read = scrub_before_read
 
     def merge(self, other: UrlPatternSanitizer) -> UrlPatternSanitizer:
         """Merge two UrlPatternSanitizers into one, unioning their pattern lists."""
@@ -637,7 +668,7 @@ class UrlPatternSanitizer(BaseSanitizer):
             if key not in seen:
                 seen.add(key)
                 combined.append((p, r))
-        return UrlPatternSanitizer(patterns=combined)
+        return UrlPatternSanitizer(patterns=combined, scrub_before_read=self.scrub_before_read)
 
     def _sanitize_url(self, url: str) -> str:
         """Apply all patterns to the URL."""
@@ -683,7 +714,12 @@ class ResponseUrlSanitizer(BaseSanitizer):
         )
     """
 
-    def __init__(self, dynamic_params: list[str], url_domains: list[str]):
+    def __init__(
+        self,
+        dynamic_params: list[str],
+        url_domains: list[str],
+        scrub_before_read: bool = False,
+    ):
         """
         Args:
             dynamic_params: Query parameter names to strip from matching URLs.
@@ -699,12 +735,14 @@ class ResponseUrlSanitizer(BaseSanitizer):
         # Pre-compile URL regex for matching target-domain URLs in body strings
         domain_alts = "|".join(re.escape(d) for d in url_domains)
         self._url_re = re.compile(rf'https?://[^\s"\'<>]*(?:{domain_alts})[^\s"\'<>]*')
+        self.scrub_before_read = scrub_before_read
 
     def merge(self, other: ResponseUrlSanitizer) -> ResponseUrlSanitizer:
         """Merge two ResponseUrlSanitizers into one, unioning their params and domains."""
         return ResponseUrlSanitizer(
             dynamic_params=list(dict.fromkeys(self.dynamic_params + other.dynamic_params)),
             url_domains=list(dict.fromkeys(self.url_domains + other.url_domains)),
+            scrub_before_read=self.scrub_before_read,
         )
 
     def _body_has_matching_domain(self, body_str: str) -> bool:
@@ -759,9 +797,10 @@ class CallbackSanitizer(BaseSanitizer):
     without subclassing BaseSanitizer.
     """
 
-    def __init__(self, before_request=None, before_response=None):
+    def __init__(self, before_request=None, before_response=None, scrub_before_read: bool = False):
         self._before_request = before_request
         self._before_response = before_response
+        self.scrub_before_read = scrub_before_read
 
     def before_record_request(self, request):
         if self._before_request:
@@ -796,9 +835,15 @@ class ConfigSecretsSanitizer(BaseSanitizer):
         sanitizer = ConfigSecretsSanitizer(config=config_dict)
     """
 
-    def __init__(self, config: dict[str, Any], replacement: str = "REDACTED"):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        replacement: str = "REDACTED",
+        scrub_before_read: bool = False,
+    ):
         self.replacement = replacement
         self.secret_values = self._extract_hash_secrets(config)
+        self.scrub_before_read = scrub_before_read
 
     @classmethod
     def from_config_file(cls, config_path, **kwargs) -> ConfigSecretsSanitizer:
@@ -866,17 +911,21 @@ class ConfigSecretsSanitizer(BaseSanitizer):
 def _dedup_sanitizers(sanitizers: list[BaseSanitizer]) -> list[BaseSanitizer]:
     """Merge same-class sanitizers to avoid redundant processing passes.
 
-    Preserves order (first occurrence of each class keeps its position).
-    Sanitizer classes without a ``merge()`` method are kept as-is.
+    Order is preserved: the first occurrence of a given key keeps its
+    position in the result, later occurrences are merged into it. Classes
+    without a ``merge()`` method are kept as-is (duplicates are not merged,
+    just left in place). Sanitizers with differing ``scrub_before_read`` are
+    never merged, so a pre-read (PII) sanitizer is kept distinct from a
+    cassette-only one.
     """
     result: list[BaseSanitizer] = []
-    by_class: dict[type, int] = {}  # class → index in result
+    by_key: dict[tuple, int] = {}  # (class, scrub_before_read) -> index in result
     for s in sanitizers:
-        cls = type(s)
-        if cls in by_class and hasattr(result[by_class[cls]], "merge"):
-            result[by_class[cls]] = result[by_class[cls]].merge(s)  # ty: ignore[unresolved-attribute]
+        key = (type(s), getattr(s, "scrub_before_read", False))
+        if key in by_key and hasattr(result[by_key[key]], "merge"):
+            result[by_key[key]] = result[by_key[key]].merge(s)  # ty: ignore[unresolved-attribute]
         else:
-            by_class[cls] = len(result)
+            by_key[key] = len(result)
             result.append(s)
     return result
 

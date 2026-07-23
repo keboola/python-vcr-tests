@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -259,6 +260,20 @@ class VCRRecorder:
             self.sanitizer = CompositeSanitizer([default, *sanitizers])
         else:
             self.sanitizer = default
+
+        # Partition: sanitizers tagged scrub_before_read=True are applied to the
+        # response BEFORE the component reads it (see _append_interaction), in
+        # addition to the cassette. The rest stay cassette-only.
+        all_sanitizers = self._flatten_sanitizers([default, *(sanitizers or [])])
+        self._pre_read_sanitizers: list[BaseSanitizer] = [
+            s for s in all_sanitizers if getattr(s, "scrub_before_read", False)
+        ]
+        self._pre_read_sanitizer: CompositeSanitizer | None = (
+            CompositeSanitizer(self._pre_read_sanitizers) if self._pre_read_sanitizers else None
+        )
+        self._pre_read_placeholders: set[str] = {
+            p for p in (getattr(s, "replacement", "") for s in self._pre_read_sanitizers) if p
+        }
 
         # Response sanitization is skipped during replay — cassettes already
         # contain sanitized data from when they were recorded.  Only request
@@ -759,16 +774,100 @@ class VCRRecorder:
                     f"The component behaviour has changed since the cassette was recorded."
                 )
 
+    def _decode_response_inplace(self, response: dict) -> None:
+        """Decompress the response body in place, but only when encoded.
+
+        vcrpy's decode_response deep-copies and returns a new dict; we copy the
+        decoded body/headers back onto the shared ``response`` so the component
+        reads decompressed content. Skipped when no Content-Encoding is present,
+        which keeps the common uncompressed path allocation-free.
+
+        Note: when a pre-read sanitizer is active, a compressed body is decoded
+        here for the component — and therefore stored decoded in the cassette —
+        even if ``decode_compressed_response=False``, because compressed bytes
+        cannot be scrubbed.
+        """
+        headers = response.get("headers", {})
+        if not any(str(k).lower() == "content-encoding" for k in headers):
+            return
+        from vcr.filters import decode_response
+
+        decoded = decode_response(response)
+        response["body"] = decoded["body"]
+        response["headers"] = decoded["headers"]
+
+    def _apply_pre_read_sanitizers(self, response: dict) -> None:
+        """Redact the shared response so the component reads redacted data.
+
+        Runs only the scrub_before_read sanitizers (PII), after decompressing the
+        body so they can match. Sanitizers may mutate `response` in place OR return
+        a new dict (the BaseSanitizer contract is return-based), so we write the
+        result back onto the shared dict to cover both — the component reads this
+        exact object via vcrpy's VCRHTTPResponse(response).
+        """
+        self._decode_response_inplace(response)
+        result = self._pre_read_sanitizer.before_record_response(response)  # ty: ignore[unresolved-attribute]
+        if result is not None and result is not response:
+            response.clear()
+            response.update(result)
+
+    def _check_no_redacted_value_sent(self, request: Any) -> None:
+        """Fail fast if the component sent a scrub_before_read placeholder to the live API.
+
+        A placeholder in an outgoing request means a tagged sanitizer redacted a
+        value the component round-trips (a cursor, ID, or token) — which breaks
+        the live follow-up call. Checked on the raw request (before request
+        sanitization) so a legitimately redacted request field is not a false hit.
+        """
+        if not self._pre_read_placeholders:
+            return
+        parts: list[str] = []
+        uri = getattr(request, "uri", None)
+        if isinstance(uri, str):
+            parts.append(uri)
+        body = getattr(request, "body", None)
+        if isinstance(body, bytes):
+            parts.append(body.decode("utf-8", errors="ignore"))
+        elif isinstance(body, str):
+            parts.append(body)
+        haystack = "\n".join(parts)
+        for placeholder in self._pre_read_placeholders:
+            if not placeholder:
+                continue
+            esc = re.escape(placeholder)
+            # Match the placeholder only where a *value* sits — a query/form value
+            # (`=PLACEHOLDER`) or a quoted/JSON value (`"PLACEHOLDER"`). A bare
+            # substring test would false-fire on common placeholders: e.g. a
+            # "token" placeholder matching `access_token=` or `/oauth/token` in an
+            # ordinary URL, aborting a valid recording.
+            if re.search(rf"=\s*{esc}(?=[&\s\"']|$)", haystack) or re.search(rf'"{esc}"', haystack):
+                tagged = ", ".join(sorted({type(s).__name__ for s in self._pre_read_sanitizers}))
+                raise VCRRecorderError(
+                    f"A scrub_before_read sanitizer redacted a value that the component "
+                    f"sent back to the live API (found placeholder {placeholder!r} as a value "
+                    f"in an outgoing request). This usually means a tagged field is round-tripped "
+                    f"by the component — a pagination cursor, ID, or token. Check your "
+                    f"scrub_before_read sanitizer(s) [{tagged}] and remove the round-tripped "
+                    f"field so it stays real during recording."
+                )
+
     def _append_interaction(self, temp_path: Path, cassette_before_record_response, request, response) -> None:
         """Serialize a single recorded interaction to the JSONL temp file."""
+        # scrub_before_read must run before the request-filter early-return below:
+        # the component reads the shared `response` dict regardless of whether this
+        # interaction is recorded, so redaction cannot depend on it.
+        if self._pre_read_sanitizer is not None:
+            self._check_no_redacted_value_sent(request)
+            self._apply_pre_read_sanitizers(response)
+
         # Apply request filter directly — avoids copy.deepcopy inside original_append
         filtered_request = self._before_record_request(request)
         if not filtered_request:
             return
 
-        # Shallow copy prevents our sanitizer from mutating the response dict
-        # that VCRHTTPResponse will return to the component.  The bytes object
-        # referenced by body["string"] is immutable, so sharing it is safe.
+        # Shallow copy prevents the cassette-only sanitizers from mutating the
+        # response dict the component reads. The bytes object referenced by
+        # body["string"] is immutable, so sharing it is safe.
         response_copy = {
             **response,
             "body": {**response.get("body", {})},
@@ -874,6 +973,17 @@ class VCRRecorder:
         my_vcr.register_serializer("json", JsonIndentedSerializer())
 
         return my_vcr
+
+    @staticmethod
+    def _flatten_sanitizers(sanitizers: list[BaseSanitizer]) -> list[BaseSanitizer]:
+        """Flatten nested CompositeSanitizers into a flat list of leaf sanitizers."""
+        flat: list[BaseSanitizer] = []
+        for s in sanitizers:
+            if isinstance(s, CompositeSanitizer):
+                flat.extend(VCRRecorder._flatten_sanitizers(s.sanitizers))
+            else:
+                flat.append(s)
+        return flat
 
     @staticmethod
     def _load_custom_sanitizers(test_data_dir: Path) -> list[BaseSanitizer] | None:
