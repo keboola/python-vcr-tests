@@ -50,7 +50,7 @@ try:
     # is present (replay).  http.client.HTTPConnection auto-reconnects on its next
     # send() if the socket has been closed — so reusing the VCRHTTPConnection is safe
     # and reuses the existing ssl_context instead of loading the CA store again.
-    try:
+    with contextlib.suppress(ImportError, AttributeError, TypeError):
         from vcr.stubs import VCRFakeSocket as _VCRFakeSocket
 
         _VCRConnection = _VCRHTTPResponse  # sentinel — replaced below
@@ -65,20 +65,16 @@ try:
             sock = getattr(self, "_sock", None)
             if isinstance(sock, _VCRFakeSocket):
                 return True  # VCR replay: fake socket is always "connected"
+            # VCR recording: always claim connected so urllib3 reuses this
+            # VCRHTTPConnection and its ssl_context instead of calling _new_conn().
+            # http.client.HTTPConnection.send() calls connect() automatically when
+            # the socket has been closed (Connection: close), so the real connection
+            # is re-established transparently on the next request.
             rc = getattr(self, "real_connection", None)
-            if rc is not None:
-                # VCR recording: always claim connected so urllib3 reuses this
-                # VCRHTTPConnection and its ssl_context instead of calling _new_conn().
-                # http.client.HTTPConnection.send() calls connect() automatically when
-                # the socket has been closed (Connection: close), so the real connection
-                # is re-established transparently on the next request.
-                return True
-            return False
+            return rc is not None
 
         _VCRConnection.is_connected = _vcr_is_connected  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         del _vcr_is_connected, _VCRHTTPConnection, _VCRConnection
-    except Exception:
-        pass
     # --- end urllib3 connection-reuse fix ---
 
     # --- VCRHTTPResponse.release_conn fix ---
@@ -105,7 +101,7 @@ try:
     # socket with a VCRFakeSocket / real_connection reconnect as usual.
     if not hasattr(_VCRHTTPResponse, "release_conn"):
 
-        def _vcr_release_conn(self) -> None:  # noqa: E306
+        def _vcr_release_conn(self) -> None:
             pool = getattr(self, "_pool", None)
             conn = getattr(self, "_connection", None)
             if pool is not None and conn is not None:
@@ -175,19 +171,13 @@ _REAL_MONOTONIC: Callable[[], float] = _make_real_monotonic()
 class VCRRecorderError(Exception):
     """Base exception for VCR recorder errors."""
 
-    pass
-
 
 class CassetteMissingError(VCRRecorderError):
     """Raised when attempting replay without a cassette."""
 
-    pass
-
 
 class SecretsLoadError(VCRRecorderError):
     """Raised when secrets file cannot be loaded."""
-
-    pass
 
 
 class VCRRecorder:
@@ -441,7 +431,7 @@ class VCRRecorder:
         output_dir = Path(data_dir) / "out" / "files"
         config_id = os.environ.get("KBC_CONFIGID", "unknown")
         component_id = os.environ.get("KBC_COMPONENTID", "component").replace(".", "-")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
         # Build sanitizer chain
         config_path = Path(data_dir) / "config.json"
@@ -459,7 +449,7 @@ class VCRRecorder:
             sanitizers=chain,
             secrets=secrets,
             record_mode="all",
-            freeze_time_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            freeze_time_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             cassette_file=f"vcr_debug_{component_id}_{config_id}_{timestamp}.json",
         )
 
@@ -724,7 +714,7 @@ class VCRRecorder:
             with open(config_path) as f:
                 config = json.load(f)
             return config.get("action", "run") or "run"
-        except Exception:
+        except (OSError, json.JSONDecodeError, ValueError, AttributeError):
             return "run"
 
     def _activate_db_replay(self) -> None:
@@ -741,7 +731,7 @@ class VCRRecorder:
                 for adapter in self.db_adapters:
                     adapter.patch_for_replay(interactions)
                 logger.info("DB replay activated: %d interactions loaded", len(interactions))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # best-effort DB replay; a hand-edited/scrubbed cassette can fail decode in many ways — log and continue without it
             logger.warning("Failed to activate DB replay: %s", e)
 
     def _deactivate_db_adapters(self) -> None:
@@ -775,10 +765,8 @@ class VCRRecorder:
     def _load_expected_status(self) -> dict | None:
         """Load expected_status.json if it exists."""
         if self.expected_status_path.exists():
-            try:
+            with contextlib.suppress(OSError, json.JSONDecodeError, ValueError):
                 return json.loads(self.expected_status_path.read_text())
-            except Exception:
-                pass
         return None
 
     @staticmethod
@@ -1107,7 +1095,7 @@ class VCRRecorder:
                     with open(config_path) as f:
                         config = json.load(f)
                 return module.get_sanitizers(config)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # loading a user-supplied sanitizers module is best-effort; log and continue
             logger.warning(f"Failed to load custom sanitizers from {sanitizers_path}: {e}")
 
         return None
@@ -1127,10 +1115,10 @@ class VCRRecorder:
     def _get_version() -> str:
         """Get keboola.vcr package version."""
         try:
-            from importlib.metadata import version
+            from importlib.metadata import PackageNotFoundError, version
 
             return version("keboola.vcr")
-        except Exception:
+        except PackageNotFoundError:
             return "unknown"
 
     @staticmethod
@@ -1343,7 +1331,7 @@ def _pool_reuse_patch():
             # it ourselves so that certificate verification works correctly.
             ctx.load_default_certs()
             pool.conn_kw["ssl_context"] = ctx
-        except Exception as exc:
+        except (ImportError, AttributeError, TypeError, OSError) as exc:
             logger.warning("VCR: could not inject shared ssl_context into pool for %s: %s", pool.host, exc)
 
     def _reusing_cfh(self, host, port=None, scheme="http", pool_kwargs=None, **kw):
@@ -1360,10 +1348,8 @@ def _pool_reuse_patch():
     finally:
         PoolManager.connection_from_host = _original_cfh
         for pool in _shared_pools.values():
-            try:
+            with contextlib.suppress(OSError):
                 pool.close()
-            except Exception:
-                pass
         _shared_pools.clear()
 
 
