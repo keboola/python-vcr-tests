@@ -56,7 +56,7 @@ import os
 import re
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from runpy import run_path
 from typing import Any
@@ -70,8 +70,6 @@ logger = logging.getLogger(__name__)
 
 class ScaffolderError(Exception):
     """Base exception for scaffolder errors."""
-
-    pass
 
 
 class TestScaffolder:
@@ -164,7 +162,7 @@ class TestScaffolder:
         # most database drivers' internal timezone/datetime handling during recording.
         # (Replay still uses freeze_time since DB VCR mocks are pure Python.)
         if freeze_time_at is None and db_adapter is None:
-            freeze_time_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            freeze_time_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
         # Auto-detect raw Keboola configs and transform
         definitions = self._normalize_definitions(definitions)
@@ -414,7 +412,7 @@ class TestScaffolder:
         try:
             recorder.record(run_component)
             logger.info(f"Recorded cassette for {test_dir.name}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # surface any recording failure as ScaffolderError
             logger.error(f"Failed to record cassette for {test_dir.name}: {e}")
             raise ScaffolderError(f"Recording failed for {test_dir.name}: {e}")
 
@@ -442,7 +440,7 @@ class TestScaffolder:
         try:
             save_output_snapshot(source_data_dir, output_subdir="out")
             logger.info(f"Saved output snapshot for {test_dir.name}")
-        except Exception as e:
+        except OSError as e:
             logger.warning(f"Failed to save snapshot for {test_dir.name}: {e}")
 
         # Restore config.json to the original dummy values

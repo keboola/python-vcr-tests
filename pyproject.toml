@@ -18,6 +18,7 @@ classifiers = [
 dependencies = [
     "vcrpy>=8.3.0,<9",  # floor 8.3.0: 8.2.1 safe-YAML security fix (GHSA-rpj2-4hq8-938g); cassette._save/append are private API we depend on
     "freezegun>=1.5.5,<2",
+    "typing-extensions>=4; python_version < '3.11'",  # typing.Self backport for db_recorder __enter__ annotations
 ]
 
 [build-system]
@@ -31,7 +32,7 @@ module-name = "keboola.vcr"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff>=0.15.0"
+    "ruff>=0.16.1"
 ]
 
 [project.urls]
@@ -50,6 +51,11 @@ target-version = "py310"
 
 [tool.ruff.lint]
 extend-select = ["I", "UP"]
+
+[tool.ruff.format]
+# ruff 0.16 formats Python inside Markdown/README by default; this repo has never
+# done that. Keep the formatter scoped to source so it doesn't churn docs.
+exclude = ["*.md"]
 
 
 [tool.pytest.ini_options]

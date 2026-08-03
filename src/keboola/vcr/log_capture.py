@@ -139,7 +139,7 @@ class LogCaptureHandler(logging.Handler):
                     timestamp=timestamp,
                 )
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # logging handler contract: route any emit error to handleError
             self.handleError(record)
 
     @property
@@ -217,15 +217,14 @@ def run_with_log_capture(
     exit_code: int | None = None
     stderr_buf = io.StringIO()
     try:
-        with contextlib.redirect_stderr(stderr_buf):
-            with warnings.catch_warnings():
-                # Prevent Python's warnings.warn() output from reaching stderr.
-                # These are library-level notices (deprecations, tz mismatches, etc.)
-                # that vary between a fresh-process recording and an in-process replay
-                # (due to per-module __warningregistry__ dedup), causing false diffs.
-                # Real component stderr output (sys.stderr.write / print) is still captured.
-                warnings.simplefilter("ignore")
-                fn()
+        with contextlib.redirect_stderr(stderr_buf), warnings.catch_warnings():
+            # Prevent Python's warnings.warn() output from reaching stderr.
+            # These are library-level notices (deprecations, tz mismatches, etc.)
+            # that vary between a fresh-process recording and an in-process replay
+            # (due to per-module __warningregistry__ dedup), causing false diffs.
+            # Real component stderr output (sys.stderr.write / print) is still captured.
+            warnings.simplefilter("ignore")
+            fn()
     except SystemExit as e:
         if e.code is None:
             exit_code = None  # sys.exit() / sys.exit(None) — clean exit, treated as 0

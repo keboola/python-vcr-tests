@@ -11,7 +11,7 @@ import json
 import re
 from abc import ABC
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 
 class BaseSanitizer(ABC):
@@ -72,7 +72,7 @@ class DefaultSanitizer(BaseSanitizer):
     - config: Keboola config dict for auto-detecting #-prefixed secrets
     """
 
-    DEFAULT_SENSITIVE_FIELDS = [
+    DEFAULT_SENSITIVE_FIELDS: ClassVar[list[str]] = [
         "access_token",
         "refresh_token",
         "id_token",
@@ -84,7 +84,7 @@ class DefaultSanitizer(BaseSanitizer):
         "token",
     ]
 
-    DEFAULT_SAFE_HEADERS = [
+    DEFAULT_SAFE_HEADERS: ClassVar[list[str]] = [
         "content-type",
         "content-length",
         "accept",
@@ -111,9 +111,9 @@ class DefaultSanitizer(BaseSanitizer):
 
         # Build header whitelist
         if safe_headers is not None:
-            self.safe_headers = set(h.lower() for h in safe_headers)
+            self.safe_headers = {h.lower() for h in safe_headers}
         else:
-            self.safe_headers = set(h.lower() for h in self.DEFAULT_SAFE_HEADERS)
+            self.safe_headers = {h.lower() for h in self.DEFAULT_SAFE_HEADERS}
         if additional_safe_headers:
             self.safe_headers.update(h.lower() for h in additional_safe_headers)
 
@@ -423,7 +423,7 @@ class HeaderSanitizer(BaseSanitizer):
     """
 
     # Default safe headers that don't contain sensitive info
-    DEFAULT_SAFE_HEADERS = [
+    DEFAULT_SAFE_HEADERS: ClassVar[list[str]] = [
         "content-type",
         "content-length",
         "accept",
@@ -455,13 +455,13 @@ class HeaderSanitizer(BaseSanitizer):
             headers_to_remove: Specific headers to always remove
         """
         if safe_headers is not None:
-            self.safe_headers = set(h.lower() for h in safe_headers)
+            self.safe_headers = {h.lower() for h in safe_headers}
         else:
-            self.safe_headers = set(h.lower() for h in self.DEFAULT_SAFE_HEADERS)
+            self.safe_headers = {h.lower() for h in self.DEFAULT_SAFE_HEADERS}
             if additional_safe_headers:
                 self.safe_headers.update(h.lower() for h in additional_safe_headers)
 
-        self.headers_to_remove = set(h.lower() for h in (headers_to_remove or []))
+        self.headers_to_remove = {h.lower() for h in (headers_to_remove or [])}
         self.scrub_before_read = scrub_before_read
 
     def merge(self, other: HeaderSanitizer) -> HeaderSanitizer:
@@ -780,7 +780,7 @@ class ResponseUrlSanitizer(BaseSanitizer):
         elif isinstance(body["string"], bytes):
             try:
                 decoded = body["string"].decode("utf-8", errors="ignore")
-            except Exception:
+            except UnicodeDecodeError:
                 return response
             if not self._body_has_matching_domain(decoded):
                 return response
@@ -859,7 +859,7 @@ class ConfigSecretsSanitizer(BaseSanitizer):
         secrets: list[str] = []
         _collect_hash_values(config, secrets)
         # Sort longest-first to prevent partial replacements
-        result: list[str] = sorted(set(s for s in secrets if s), key=len, reverse=True)  # ty: ignore[invalid-assignment]
+        result: list[str] = sorted({s for s in secrets if s}, key=len, reverse=True)  # ty: ignore[invalid-assignment]
         return result
 
     def _sanitize_string(self, value: str) -> str:
@@ -966,7 +966,7 @@ def extract_values(d: dict, values: list[str] | None = None) -> list[str]:
     """
     if values is None:
         values = []
-    for key, value in d.items():
+    for value in d.values():
         if isinstance(value, str) and value:
             values.append(value)
             # If the string is JSON, parse and extract inner values
