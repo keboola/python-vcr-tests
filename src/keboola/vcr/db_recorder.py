@@ -19,11 +19,17 @@ import hashlib
 import json
 import logging
 import re
+import sys
 from abc import ABC, abstractmethod
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 
 logger = logging.getLogger(__name__)
 
@@ -246,10 +252,10 @@ class _RecordingConnection:
     def close(self) -> None:
         self._conn.close()
 
-    def __enter__(self) -> _RecordingConnection:
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *args: Any) -> None:
+    def __exit__(self, *args: object) -> None:
         self.close()
 
 
@@ -325,10 +331,10 @@ class _RecordingCursor:
             self._log.append(self._current_entry)
             self._current_entry = None
 
-    def __enter__(self) -> _RecordingCursor:
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *args: Any) -> None:
+    def __exit__(self, *args: object) -> None:
         self.close()
 
 
@@ -376,10 +382,10 @@ class _ReplayConnection:
     def close(self) -> None:
         pass
 
-    def __enter__(self) -> _ReplayConnection:
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *args: Any) -> None:
+    def __exit__(self, *args: object) -> None:
         pass
 
 
@@ -428,18 +434,18 @@ class _ReplayCursor:
     def close(self) -> None:
         pass
 
-    def __enter__(self) -> _ReplayCursor:
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *args: Any) -> None:
+    def __exit__(self, *args: object) -> None:
         pass
 
 
 def _get_version() -> str:
     """Get keboola.vcr package version."""
     try:
-        from importlib.metadata import version
+        from importlib.metadata import PackageNotFoundError, version
 
         return version("keboola.vcr")
-    except Exception:
+    except PackageNotFoundError:
         return "unknown"

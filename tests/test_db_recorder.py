@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock
 
@@ -35,7 +35,7 @@ def _roundtrip(value):
 
 class TestDBEncoder:
     def test_datetime_roundtrip(self):
-        dt = datetime(2024, 3, 15, 10, 30, 0)
+        dt = datetime(2024, 3, 15, 10, 30, 0, tzinfo=timezone.utc)
         assert _roundtrip(dt) == dt
 
     def test_date_roundtrip(self):
@@ -60,9 +60,9 @@ class TestDBEncoder:
         assert _roundtrip(None) is None
 
     def test_list_with_mixed_types(self):
-        value = [datetime(2024, 1, 1), Decimal("1.5"), "text", 99]
+        value = [datetime(2024, 1, 1, tzinfo=timezone.utc), Decimal("1.5"), "text", 99]
         result = _roundtrip(value)
-        assert result[0] == datetime(2024, 1, 1)
+        assert result[0] == datetime(2024, 1, 1, tzinfo=timezone.utc)
         assert result[1] == Decimal("1.5")
         assert result[2] == "text"
         assert result[3] == 99

@@ -8,6 +8,7 @@ storing full expected files.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import difflib
 import fnmatch
@@ -337,7 +338,7 @@ class OutputSnapshot:
         actual_path: Path,
     ) -> str | None:
         """Generate unified diff between two files."""
-        try:
+        with contextlib.suppress(OSError, UnicodeDecodeError):
             with open(expected_path, encoding="utf-8") as f:
                 expected_lines = f.readlines()
             with open(actual_path, encoding="utf-8") as f:
@@ -355,8 +356,6 @@ class OutputSnapshot:
 
             if diff:
                 return "\n".join(diff)
-        except Exception:
-            pass
 
         return None
 
@@ -372,7 +371,7 @@ class OutputSnapshot:
 
                 row_count = sum(1 for _ in reader) + 1  # +1 for header
                 return row_count, header
-        except Exception:
+        except (OSError, csv.Error, UnicodeDecodeError):
             return None, None
 
     def _hash_file(self, file_path: Path) -> str:
