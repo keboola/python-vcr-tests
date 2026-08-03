@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,6 +146,32 @@ from .sanitizers import (
 logger = logging.getLogger(__name__)
 
 
+# Captured at import — before any freeze_time() is ever applied.
+#
+# A bare `_REAL_MONOTONIC = time.monotonic` is NOT enough: freezegun's
+# freeze_time().start() walks every already-imported module's attributes and
+# replaces any value that `is real_monotonic` (a plain identity check) with its
+# fake, specifically to close the "stash a reference before freezing" loophole.
+# Since `keboola.vcr.recorder` is already imported by the time a test enters
+# freeze_time(), a bare module-level reference would get swapped right along
+# with `time.monotonic` itself.
+#
+# Wrapping the captured reference in a closure sidesteps this: the module-level
+# name is bound to a distinct function object (this closure), not to
+# `time.monotonic` itself, so freezegun's identity scan never matches it — the
+# closure keeps calling the genuine builtin even while frozen.
+def _make_real_monotonic() -> Callable[[], float]:
+    real = time.monotonic
+
+    def _real_monotonic() -> float:
+        return real()
+
+    return _real_monotonic
+
+
+_REAL_MONOTONIC: Callable[[], float] = _make_real_monotonic()
+
+
 class VCRRecorderError(Exception):
     """Base exception for VCR recorder errors."""
 
@@ -248,6 +275,7 @@ class VCRRecorder:
         # Each adapter patches its driver's connect() before the component runs.
         self.db_adapters: list = db_adapters or []
         self._db_interaction_log: _StreamingDBLog | list[dict] | None = []
+        self._reset_perf_state()
 
         # Set after replay — can be checked by callers (e.g. VCRTestDataDir)
         self.last_log_comparison: LogComparisonResult | None = None
@@ -282,6 +310,15 @@ class VCRRecorder:
 
         # Configure VCR
         self._vcr = self._create_vcr_instance()
+
+    def _reset_perf_state(self) -> None:
+        """Reset per-recording performance counters and timing anchors."""
+        self._perf_request_pairs = 0
+        self._perf_first_interaction_mono: float | None = None
+        self._perf_last_interaction_mono: float | None = None
+        self._perf_run_start_wall: datetime | None = None
+        self._perf_run_start_mono: float | None = None
+        self._perf_run_end_mono: float | None = None
 
     @classmethod
     def from_test_dir(
@@ -880,6 +917,14 @@ class VCRRecorder:
         filtered_response = cassette_before_record_response(response_copy)
         if filtered_response is None:
             return
+
+        # Performance accounting — count pairs and stamp the data-collection window.
+        # Uses the pre-freeze real clock so the window is correct even under freeze_time.
+        now_mono = _REAL_MONOTONIC()
+        if self._perf_first_interaction_mono is None:
+            self._perf_first_interaction_mono = now_mono
+        self._perf_last_interaction_mono = now_mono
+        self._perf_request_pairs += 1
 
         with open(temp_path, "a") as f:
             _write_interaction(f, filtered_request._to_dict(), filtered_response)

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from freezegun import freeze_time
 
 from keboola.vcr.recorder import (
     JsonIndentedSerializer,
@@ -511,3 +513,48 @@ class TestRedactedValueGuardrail:
         req = _make_request(uri="https://api.example.com/v1/data?cursor=REDACTED")
         with pytest.raises(VCRRecorderError, match="BodyFieldSanitizer"):
             r._append_interaction(temp, r._before_record_response, req, response)
+
+
+# ---------------------------------------------------------------------------
+# _append_interaction performance counters and timing anchors
+# ---------------------------------------------------------------------------
+
+
+class TestAppendInteractionPerf:
+    def test_counts_and_anchors_each_written_interaction(self, tmp_cassette_dir, mock_response):
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir)
+        temp_path = tmp_cassette_dir / "interactions.jsonl.tmp"
+        req = _make_request()
+
+        # cassette_before_record_response passthrough (no vcrpy machinery needed here)
+        def passthrough(resp):
+            return resp
+
+        r._append_interaction(temp_path, passthrough, req, mock_response)
+        r._append_interaction(temp_path, passthrough, req, mock_response)
+
+        assert r._perf_request_pairs == 2
+        assert r._perf_first_interaction_mono is not None
+        assert r._perf_last_interaction_mono is not None
+        assert r._perf_last_interaction_mono >= r._perf_first_interaction_mono
+
+    def test_anchors_advance_under_frozen_clock(self, tmp_cassette_dir, mock_response):
+        # Load-bearing regression: freezegun freezes time.monotonic. If _append_interaction
+        # used a bare time.monotonic() the two anchors would be identical. The pre-freeze
+        # _REAL_MONOTONIC reference must still advance.
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir)
+        temp_path = tmp_cassette_dir / "interactions.jsonl.tmp"
+        req = _make_request()
+
+        def passthrough(resp):
+            return resp
+
+        with freeze_time("2020-01-01T00:00:00Z"):
+            r._append_interaction(temp_path, passthrough, req, mock_response)
+            first = r._perf_first_interaction_mono
+            time.sleep(0.01)
+            r._append_interaction(temp_path, passthrough, req, mock_response)
+            last = r._perf_last_interaction_mono
+
+        assert first is not None and last is not None
+        assert last > first
