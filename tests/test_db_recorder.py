@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from keboola.vcr.db_recorder import (
+    DBAdapter,
     _db_decode_hook,
     _DBEncoder,
     _expand_description,
@@ -21,6 +22,7 @@ from keboola.vcr.db_recorder import (
     _slim_description,
     _StreamingDBLog,
 )
+from keboola.vcr.recorder import VCRRecorder
 
 # ---------------------------------------------------------------------------
 # _DBEncoder + _db_decode_hook — round-trip serialization
@@ -498,3 +500,66 @@ class TestRecordingCursor:
         with cursor:
             cursor.execute("SELECT 1 FROM DUAL")
         assert len(log) == 1
+
+
+# ---------------------------------------------------------------------------
+# VCRRecorder.record() — db_query_pairs metadata (integration)
+# ---------------------------------------------------------------------------
+
+
+class _FakeDBAdapter(DBAdapter):
+    """Minimal DBAdapter double for tests.
+
+    Real adapters (e.g. OracleDBAdapter) monkey-patch a driver's connect()
+    so that _RecordingCursor calls append entries to the interaction log as
+    the component issues queries. This fake skips the driver-patching and
+    just hands the log to the runner, which appends entries directly —
+    exercising the same `record()` -> `_StreamingDBLog` -> `db_query_pairs`
+    path without needing a real DB driver.
+    """
+
+    def __init__(self) -> None:
+        self.log: _StreamingDBLog | None = None
+
+    @property
+    def driver_name(self) -> str:
+        return "fakedb"
+
+    def patch_for_record(self, interaction_log) -> None:
+        self.log = interaction_log
+
+    def patch_for_replay(self, interactions) -> None:
+        pass
+
+    def unpatch(self) -> None:
+        self.log = None
+
+
+class TestRecordDBQueryPairs:
+    def test_db_query_pairs_matches_recorded_db_interactions(self, tmp_cassette_dir):
+        n_queries = 3
+        adapter = _FakeDBAdapter()
+        r = VCRRecorder(
+            cassette_dir=tmp_cassette_dir,
+            capture_logs=False,
+            freeze_time_at=None,
+            db_adapters=[adapter],
+        )
+
+        def runner():
+            assert adapter.log is not None
+            for i in range(n_queries):
+                adapter.log.append(
+                    {
+                        "sql_normalized": f"SELECT {i} FROM DUAL",
+                        "params_hash": _params_hash(None),
+                        "description": None,
+                        "rows": [[i]],
+                    }
+                )
+
+        r.record(runner)
+
+        meta = VCRRecorder.load_metadata(r.cassette_path)
+        assert meta["db_query_pairs"] == n_queries
+        assert meta["db_driver"] == "fakedb"
