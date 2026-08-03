@@ -57,23 +57,43 @@ The component runs inside `freeze_time()`
 of the freeze, so **any duration measured naively inside the run reads as zero** and any
 wall-clock read inside the run returns the frozen instant.
 
-Fix: capture a module-level reference to the real clock **before any freeze is applied**:
+Fix: wrap a reference to the real clock in a **closure**, captured before any freeze is
+applied:
 
 ```python
 import time
-_REAL_MONOTONIC = time.monotonic  # captured at import, before freeze_time is ever active
+from typing import Callable
+
+def _make_real_monotonic() -> Callable[[], float]:
+    real = time.monotonic
+
+    def _real_monotonic() -> float:
+        return real()
+
+    return _real_monotonic
+
+_REAL_MONOTONIC: Callable[[], float] = _make_real_monotonic()
 ```
 
-freezegun swaps only the `time.monotonic` *attribute*; a reference captured earlier still
-points at the genuine builtin, so `_REAL_MONOTONIC()` returns real time even inside the
-freeze. `recorder.py` is imported at process start, before any `record()` call applies a
-freeze, so the reference is genuine. All durations use `_REAL_MONOTONIC`. Wall-clock ISO
-anchors come from **one** real `datetime.now(timezone.utc)` read taken outside the freeze
+A bare `_REAL_MONOTONIC = time.monotonic` is **not** enough: freezegun's
+`freeze_time().start()` walks every already-imported module's attributes and rebinds any
+value that `is time.monotonic` (a plain identity check) to its fake — specifically to close
+the "stash a reference before freezing" loophole. Since `keboola.vcr.recorder` is already
+imported by the time a test enters `freeze_time()`, a bare module-level alias would be
+swapped right along with `time.monotonic` itself.
+
+The closure sidesteps this: the module-level name `_REAL_MONOTONIC` is bound to a distinct
+function object (the closure), never to `time.monotonic` itself, so freezegun's identity
+scan never matches it. The genuine clock lives in the closure's `real` cell variable, which
+is not a module attribute and so is invisible to the scan — `_REAL_MONOTONIC()` keeps
+returning real time even inside the freeze. All durations use `_REAL_MONOTONIC`. Wall-clock
+ISO anchors come from **one** real `datetime.now(timezone.utc)` read taken outside the freeze
 (just before `component_runner()` is invoked), with per-interaction offsets derived from
 monotonic deltas.
 
-Rejected alternative: reading wall-clock at each boundary. It is zeroed/frozen inside the
-run, so it cannot measure the recording window.
+Rejected alternatives: reading wall-clock at each boundary (zeroed/frozen inside the run, so
+it cannot measure the recording window); a bare module-level alias (swapped by freezegun's
+attribute scan, as above).
 
 ## New `_metadata` fields
 
@@ -110,7 +130,8 @@ untouched (metadata is written only when recording).
 
 - Add `timedelta` to `from datetime import datetime, timezone` → `datetime, timedelta, timezone`.
 - Add `import time`.
-- Add module-level `_REAL_MONOTONIC = time.monotonic`.
+- Add module-level `_REAL_MONOTONIC`, a closure over the real `time.monotonic` (see the
+  freeze-time gotcha above — a bare alias would be swapped by freezegun too).
 
 ### `record()` — state and anchors
 

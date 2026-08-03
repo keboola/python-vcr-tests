@@ -98,10 +98,21 @@ import time
 Add the module-level constant just after the import block ends (near the other module-level constants such as `DEFAULT_CASSETTE_FILE`, before the first class):
 
 ```python
-# Captured at import — before any freeze_time() is ever applied. freezegun rebinds the
-# time.monotonic *attribute* during a freeze, but a reference captured earlier still calls
-# the genuine builtin, so this returns real elapsed time even inside a frozen component run.
-_REAL_MONOTONIC = time.monotonic
+# Captured at import — before any freeze_time() is ever applied. A bare
+# `_REAL_MONOTONIC = time.monotonic` would be swapped too: freezegun's identity scan
+# rebinds it right along with time.monotonic. Wrapping it in a closure (shipped form,
+# per the freezegun reason in recorder.py) keeps the genuine clock in a cell variable
+# the scan never reaches.
+def _make_real_monotonic() -> Callable[[], float]:
+    real = time.monotonic
+
+    def _real_monotonic() -> float:
+        return real()
+
+    return _real_monotonic
+
+
+_REAL_MONOTONIC: Callable[[], float] = _make_real_monotonic()
 ```
 
 - [ ] **Step 4: Add `_reset_perf_state` and call it from `__init__`**

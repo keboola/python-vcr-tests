@@ -335,7 +335,7 @@ class VCRRecorder:
         start_mono = self._perf_run_start_mono
         end_mono = self._perf_run_end_mono
         assert start_wall is not None and start_mono is not None and end_mono is not None, (
-            "_build_perf_metadata() requires the run anchors set by _reset_perf_state()/record()"
+            "_build_perf_metadata() requires run anchors populated by record() before it is called"
         )
         run_dur = end_mono - start_mono
         meta: dict = {
