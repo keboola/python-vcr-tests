@@ -515,6 +515,7 @@ class VCRRecorder:
         """
         self.cassette_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Recording HTTP interactions to {self.cassette_path}")
+        self._reset_perf_state()
 
         action = self._get_action_name()
         stdout_capture = io.StringIO() if action != "run" else None
@@ -560,11 +561,16 @@ class VCRRecorder:
                 cassette._save = lambda force=False: None
 
                 with _pool_reuse_patch():
-                    if stdout_capture is not None:
-                        with contextlib.redirect_stdout(stdout_capture):
+                    self._perf_run_start_wall = datetime.now(timezone.utc)
+                    self._perf_run_start_mono = _REAL_MONOTONIC()
+                    try:
+                        if stdout_capture is not None:
+                            with contextlib.redirect_stdout(stdout_capture):
+                                self._run_with_freeze(component_runner)
+                        else:
                             self._run_with_freeze(component_runner)
-                    else:
-                        self._run_with_freeze(component_runner)
+                    finally:
+                        self._perf_run_end_mono = _REAL_MONOTONIC()
 
         run_result: ComponentRunResult | None = None
         try:
@@ -593,15 +599,20 @@ class VCRRecorder:
             else:
                 self.sync_action_result_path.unlink(missing_ok=True)
 
-        metadata = {
+        metadata: dict[str, Any] = {
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             "freeze_time": self.freeze_time_at,
             "keboola_vcr_version": self._get_version(),
         }
+        metadata.update(self._build_perf_metadata())
         # Add DB adapter metadata
         if self.db_adapters:
             metadata["db_driver"] = self.db_adapters[0].driver_name
             metadata["keboola_db_vcr_version"] = self._get_version()
+            # self._db_interaction_log is set to a _StreamingDBLog (never None) above
+            # whenever self.db_adapters is truthy — see the block right before _run_in_vcr.
+            assert self._db_interaction_log is not None
+            metadata["db_query_pairs"] = len(self._db_interaction_log)
 
         try:
             self._write_cassette(temp_path, metadata, db_temp_path=db_temp_path)

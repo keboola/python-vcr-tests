@@ -606,3 +606,29 @@ class TestBuildPerfMetadata:
         assert meta["recording_started_at"] is None
         assert meta["recording_ended_at"] is None
         assert meta["recording_duration_seconds"] is None
+
+
+# ---------------------------------------------------------------------------
+# record() perf metadata wiring (integration)
+# ---------------------------------------------------------------------------
+
+
+class TestRecordPerfMetadata:
+    def test_no_http_run_writes_perf_fields(self, tmp_cassette_dir):
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, capture_logs=False, freeze_time_at=None)
+
+        def runner():
+            time.sleep(0.02)  # ensure a measurable, non-negative duration
+
+        r.record(runner)
+
+        meta = VCRRecorder.load_metadata(r.cassette_path)
+        assert meta["request_pairs"] == 0
+        assert meta["component_run_duration_seconds"] >= 0.0
+        assert meta["component_run_started_at"] is not None
+        assert meta["component_run_ended_at"] is not None
+        assert meta["recording_started_at"] is None
+        assert meta["recording_ended_at"] is None
+        assert meta["recording_duration_seconds"] is None
+        # db_query_pairs only present when a DB adapter is configured
+        assert "db_query_pairs" not in meta
