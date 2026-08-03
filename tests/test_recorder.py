@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from freezegun import freeze_time
 
 from keboola.vcr.recorder import (
     JsonIndentedSerializer,
@@ -511,3 +514,121 @@ class TestRedactedValueGuardrail:
         req = _make_request(uri="https://api.example.com/v1/data?cursor=REDACTED")
         with pytest.raises(VCRRecorderError, match="BodyFieldSanitizer"):
             r._append_interaction(temp, r._before_record_response, req, response)
+
+
+# ---------------------------------------------------------------------------
+# _append_interaction performance counters and timing anchors
+# ---------------------------------------------------------------------------
+
+
+class TestAppendInteractionPerf:
+    def test_counts_and_anchors_each_written_interaction(self, tmp_cassette_dir, mock_response):
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir)
+        temp_path = tmp_cassette_dir / "interactions.jsonl.tmp"
+        req = _make_request()
+
+        # cassette_before_record_response passthrough (no vcrpy machinery needed here)
+        def passthrough(resp):
+            return resp
+
+        r._append_interaction(temp_path, passthrough, req, mock_response)
+        r._append_interaction(temp_path, passthrough, req, mock_response)
+
+        assert r._perf_request_pairs == 2
+        assert r._perf_first_interaction_mono is not None
+        assert r._perf_last_interaction_mono is not None
+        assert r._perf_last_interaction_mono >= r._perf_first_interaction_mono
+
+    def test_anchors_advance_under_frozen_clock(self, tmp_cassette_dir, mock_response):
+        # Load-bearing regression: freezegun freezes time.monotonic. If _append_interaction
+        # used a bare time.monotonic() the two anchors would be identical. The pre-freeze
+        # _REAL_MONOTONIC reference must still advance.
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir)
+        temp_path = tmp_cassette_dir / "interactions.jsonl.tmp"
+        req = _make_request()
+
+        def passthrough(resp):
+            return resp
+
+        with freeze_time("2020-01-01T00:00:00Z"):
+            r._append_interaction(temp_path, passthrough, req, mock_response)
+            first = r._perf_first_interaction_mono
+            time.sleep(0.01)
+            r._append_interaction(temp_path, passthrough, req, mock_response)
+            last = r._perf_last_interaction_mono
+
+        assert first is not None and last is not None
+        assert last > first
+
+
+# ---------------------------------------------------------------------------
+# _build_perf_metadata
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPerfMetadata:
+    def _recorder(self, tmp_cassette_dir):
+        return VCRRecorder(cassette_dir=tmp_cassette_dir)
+
+    def test_window_is_subset_of_run_and_durations_match(self, tmp_cassette_dir):
+        r = self._recorder(tmp_cassette_dir)
+        r._perf_run_start_wall = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        r._perf_run_start_mono = 100.0
+        r._perf_run_end_mono = 110.0  # 10.0s whole run
+        r._perf_first_interaction_mono = 102.0  # +2.0s
+        r._perf_last_interaction_mono = 107.5  # +7.5s
+        r._perf_request_pairs = 3
+
+        meta = r._build_perf_metadata()
+
+        assert meta["request_pairs"] == 3
+        assert meta["component_run_started_at"] == "2026-01-01T12:00:00+00:00"
+        assert meta["component_run_ended_at"] == "2026-01-01T12:00:10+00:00"
+        assert meta["component_run_duration_seconds"] == 10.0
+        assert meta["recording_started_at"] == "2026-01-01T12:00:02+00:00"
+        assert meta["recording_ended_at"] == "2026-01-01T12:00:07.500000+00:00"
+        assert meta["recording_duration_seconds"] == 5.5
+        # window within run
+        assert meta["recording_started_at"] >= meta["component_run_started_at"]
+        assert meta["recording_ended_at"] <= meta["component_run_ended_at"]
+
+    def test_no_interactions_yields_null_recording_fields(self, tmp_cassette_dir):
+        r = self._recorder(tmp_cassette_dir)
+        r._perf_run_start_wall = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        r._perf_run_start_mono = 100.0
+        r._perf_run_end_mono = 104.25
+        # no interactions -> anchors stay None, request_pairs stays 0
+
+        meta = r._build_perf_metadata()
+
+        assert meta["request_pairs"] == 0
+        assert meta["component_run_duration_seconds"] == 4.25
+        assert meta["recording_started_at"] is None
+        assert meta["recording_ended_at"] is None
+        assert meta["recording_duration_seconds"] is None
+
+
+# ---------------------------------------------------------------------------
+# record() perf metadata wiring (integration)
+# ---------------------------------------------------------------------------
+
+
+class TestRecordPerfMetadata:
+    def test_no_http_run_writes_perf_fields(self, tmp_cassette_dir):
+        r = VCRRecorder(cassette_dir=tmp_cassette_dir, capture_logs=False, freeze_time_at=None)
+
+        def runner():
+            time.sleep(0.02)  # ensure a measurable, non-negative duration
+
+        r.record(runner)
+
+        meta = VCRRecorder.load_metadata(r.cassette_path)
+        assert meta["request_pairs"] == 0
+        assert meta["component_run_duration_seconds"] >= 0.0
+        assert meta["component_run_started_at"] is not None
+        assert meta["component_run_ended_at"] is not None
+        assert meta["recording_started_at"] is None
+        assert meta["recording_ended_at"] is None
+        assert meta["recording_duration_seconds"] is None
+        # db_query_pairs only present when a DB adapter is configured
+        assert "db_query_pairs" not in meta
