@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -558,3 +559,50 @@ class TestAppendInteractionPerf:
 
         assert first is not None and last is not None
         assert last > first
+
+
+# ---------------------------------------------------------------------------
+# _build_perf_metadata
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPerfMetadata:
+    def _recorder(self, tmp_cassette_dir):
+        return VCRRecorder(cassette_dir=tmp_cassette_dir)
+
+    def test_window_is_subset_of_run_and_durations_match(self, tmp_cassette_dir):
+        r = self._recorder(tmp_cassette_dir)
+        r._perf_run_start_wall = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        r._perf_run_start_mono = 100.0
+        r._perf_run_end_mono = 110.0  # 10.0s whole run
+        r._perf_first_interaction_mono = 102.0  # +2.0s
+        r._perf_last_interaction_mono = 107.5  # +7.5s
+        r._perf_request_pairs = 3
+
+        meta = r._build_perf_metadata()
+
+        assert meta["request_pairs"] == 3
+        assert meta["component_run_started_at"] == "2026-01-01T12:00:00+00:00"
+        assert meta["component_run_ended_at"] == "2026-01-01T12:00:10+00:00"
+        assert meta["component_run_duration_seconds"] == 10.0
+        assert meta["recording_started_at"] == "2026-01-01T12:00:02+00:00"
+        assert meta["recording_ended_at"] == "2026-01-01T12:00:07.500000+00:00"
+        assert meta["recording_duration_seconds"] == 5.5
+        # window within run
+        assert meta["recording_started_at"] >= meta["component_run_started_at"]
+        assert meta["recording_ended_at"] <= meta["component_run_ended_at"]
+
+    def test_no_interactions_yields_null_recording_fields(self, tmp_cassette_dir):
+        r = self._recorder(tmp_cassette_dir)
+        r._perf_run_start_wall = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        r._perf_run_start_mono = 100.0
+        r._perf_run_end_mono = 104.25
+        # no interactions -> anchors stay None, request_pairs stays 0
+
+        meta = r._build_perf_metadata()
+
+        assert meta["request_pairs"] == 0
+        assert meta["component_run_duration_seconds"] == 4.25
+        assert meta["recording_started_at"] is None
+        assert meta["recording_ended_at"] is None
+        assert meta["recording_duration_seconds"] is None

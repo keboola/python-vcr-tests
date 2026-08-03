@@ -19,7 +19,7 @@ import os
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import IO, Any
 
@@ -319,6 +319,44 @@ class VCRRecorder:
         self._perf_run_start_wall: datetime | None = None
         self._perf_run_start_mono: float | None = None
         self._perf_run_end_mono: float | None = None
+
+    def _build_perf_metadata(self) -> dict:
+        """Assemble performance fields for the cassette _metadata from captured anchors.
+
+        Durations come from the real monotonic clock; wall-clock ISO anchors are derived
+        from the single real start reading plus monotonic offsets, so they stay consistent
+        and immune to clock adjustments during the run. Does not include db_query_pairs.
+
+        Preconditions (guaranteed by record() before this is called): the run anchors
+        (_perf_run_start_wall/_perf_run_start_mono/_perf_run_end_mono) are set. Read into
+        locals so the type checker can narrow them from `X | None` to `X`.
+        """
+        start_wall = self._perf_run_start_wall
+        start_mono = self._perf_run_start_mono
+        end_mono = self._perf_run_end_mono
+        assert start_wall is not None and start_mono is not None and end_mono is not None, (
+            "_build_perf_metadata() requires the run anchors set by _reset_perf_state()/record()"
+        )
+        run_dur = end_mono - start_mono
+        meta: dict = {
+            "request_pairs": self._perf_request_pairs,
+            "component_run_started_at": start_wall.isoformat(),
+            "component_run_ended_at": (start_wall + timedelta(seconds=run_dur)).isoformat(),
+            "component_run_duration_seconds": round(run_dur, 3),
+        }
+        first_mono = self._perf_first_interaction_mono
+        last_mono = self._perf_last_interaction_mono
+        if first_mono is not None and last_mono is not None:
+            first_off = first_mono - start_mono
+            last_off = last_mono - start_mono
+            meta["recording_started_at"] = (start_wall + timedelta(seconds=first_off)).isoformat()
+            meta["recording_ended_at"] = (start_wall + timedelta(seconds=last_off)).isoformat()
+            meta["recording_duration_seconds"] = round(last_mono - first_mono, 3)
+        else:
+            meta["recording_started_at"] = None
+            meta["recording_ended_at"] = None
+            meta["recording_duration_seconds"] = None
+        return meta
 
     @classmethod
     def from_test_dir(
