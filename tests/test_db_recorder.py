@@ -495,6 +495,24 @@ class TestRecordingCursor:
         cursor.__del__()  # second call should not double-append
         assert len(log) == 1
 
+    def test_each_execute_on_one_cursor_recorded(self):
+        cursor, log = _make_recording_cursor(rows=[[1]])
+        for sql in ("SELECT 1 FROM DUAL", "SELECT 2 FROM DUAL", "SELECT 3 FROM DUAL"):
+            cursor.execute(sql)
+            cursor.fetchall()
+        cursor.close()
+        assert [e["sql_normalized"] for e in log] == ["SELECT 1 FROM DUAL", "SELECT 2 FROM DUAL", "SELECT 3 FROM DUAL"]
+        assert all(e["rows"] == [[1]] for e in log)
+
+    def test_execute_error_after_query_keeps_both(self):
+        cursor, log = _make_recording_cursor(rows=[[1]])
+        cursor.execute("SELECT 1 FROM DUAL")
+        cursor._cursor.execute.side_effect = RuntimeError("boom")
+        with pytest.raises(RuntimeError):
+            cursor.execute("SELECT 2 FROM DUAL")
+        cursor.close()
+        assert [e["sql_normalized"] for e in log] == ["SELECT 1 FROM DUAL", "SELECT 2 FROM DUAL"]
+
     def test_context_manager_calls_close(self):
         cursor, log = _make_recording_cursor(rows=[[1]])
         with cursor:
