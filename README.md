@@ -96,6 +96,9 @@ python -m keboola.vcr.proxy --mode replay --config tests/vcr.json --confdir /vcr
   different branch than the recording did.
 - **No time freezing:** a request whose URL or body carries the current date will not match on replay. Pin such
   values in the test config.
+- **Where it runs:** wherever the component's tests run, usually its local Docker Compose stack, with the
+  credentials in the folder's `.env`. CI can run the same stack. It cannot record a platform debug job: the platform
+  runs only the component image, without the proxy container (use `VCRRecorder.record_debug_run` in Python).
 
 `tests/vcr.json` replaces the `VCR_SANITIZERS` list of a Python component:
 
