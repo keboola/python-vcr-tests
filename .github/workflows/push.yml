@@ -61,7 +61,8 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies 📦
-        run: uv sync --all-groups --frozen
+        # --all-extras: the proxy extra (mitmproxy) runs the real proxy round-trip test
+        run: uv sync --all-groups --all-extras --frozen
 
       - name: Test with pytest ✅
         run: uv run pytest tests/
