@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import gzip
 import json
 import socket
 import threading
@@ -281,6 +283,111 @@ def test_replay_masks_multipart_boundaries(tmp_path):
     assert _session(tmp_path, "replay").replay(multipart("bbb222")) is not None
 
 
+def test_replay_masks_mixed_case_multipart_boundaries(tmp_path):
+    url = "https://api.example.com/upload"
+
+    def multipart(boundary: str) -> Request:
+        body = f"--{boundary}\r\n\r\nhello\r\n--{boundary}--\r\n"
+        return Request("POST", url, body.encode(), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    _recorded(tmp_path, [(multipart("----FormBoundaryAbC"), _resp("{}"))])
+    assert _session(tmp_path, "replay").replay(multipart("----FormBoundaryXyZ")) is not None
+
+
+GZIP_CHUNK = gzip.compress(b"col1,col2\n" + bytes(range(256)) * 8, mtime=0)
+UPLOAD_URL = "https://tenant.sharepoint.com/sites/x/_api/v2.0/drive/items/1/uploadSession?guid=abc"
+OCTET = {"Content-Type": "application/octet-stream", "Content-Range": "bytes 0-99/100"}
+
+
+def test_replay_matches_identical_binary_body(tmp_path):
+    other = gzip.compress(b"another chunk" + bytes(range(256)), mtime=0)
+    _recorded(
+        tmp_path,
+        [
+            (Request("PUT", UPLOAD_URL, GZIP_CHUNK, OCTET), _resp('{"part": 1}')),
+            (Request("PUT", UPLOAD_URL, other, OCTET), _resp('{"part": 2}')),
+        ],
+    )
+    recorded = json.loads((tmp_path / "cassettes" / "requests.json").read_text())["interactions"][0]["request"]
+    assert recorded["body_encoding"] == "base64"
+    assert base64.b64decode(recorded["body"]) == GZIP_CHUNK
+    s = _session(tmp_path, "replay")
+    assert json.loads(response_parts(s.replay(Request("PUT", UPLOAD_URL, other, OCTET)))[3]) == {"part": 2}
+    assert json.loads(response_parts(s.replay(Request("PUT", UPLOAD_URL, GZIP_CHUNK, OCTET)))[3]) == {"part": 1}
+    assert s.unmatched == []
+
+
+def test_replay_rejects_different_binary_body(tmp_path):
+    _recorded(tmp_path, [(Request("PUT", UPLOAD_URL, GZIP_CHUNK, OCTET), _resp("{}"))])
+    s = _session(tmp_path, "replay")
+    changed = GZIP_CHUNK[:-1] + bytes([GZIP_CHUNK[-1] ^ 0xFF])
+    assert s.replay(Request("PUT", UPLOAD_URL, changed, OCTET)) is None
+    # a text body that spells the recorded base64 is still not the recorded bytes
+    as_text = base64.b64encode(GZIP_CHUNK)
+    assert s.replay(Request("PUT", UPLOAD_URL, as_text, {"Content-Type": "text/plain"})) is None
+    assert len(s.unmatched) == 2
+
+
+def test_replay_binary_body_still_sanitizes_the_url(tmp_path):
+    url = f"{UPLOAD_URL}&access_token={SECRET}"
+    _recorded(tmp_path, [(Request("PUT", url, GZIP_CHUNK, OCTET), _resp("{}"))])
+    assert SECRET not in (tmp_path / "cassettes" / "requests.json").read_text()
+    replayed = Request("PUT", f"{UPLOAD_URL}&access_token=dummy", GZIP_CHUNK, OCTET)
+    assert _session(tmp_path, "replay").replay(replayed) is not None
+
+
+def test_replay_masks_boundaries_in_binary_multipart(tmp_path):
+    url = "https://api.example.com/upload"
+
+    def multipart(boundary: str) -> Request:
+        body = f"--{boundary}\r\nContent-Type: application/gzip\r\n\r\n".encode() + GZIP_CHUNK
+        body += f"\r\n--{boundary}--\r\n".encode()
+        return Request("POST", url, body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    _recorded(tmp_path, [(multipart("aaa111"), _resp("{}"))])
+    assert _session(tmp_path, "replay").replay(multipart("bbb222")) is not None
+
+
+def test_replay_reads_existing_text_and_base64_cassettes(tmp_path):
+    """Cassettes written before the fix (text and base64 request bodies) replay unchanged."""
+    path = tmp_path / "cassettes" / "requests.json"
+    path.parent.mkdir(parents=True)
+    ok = {"status": {"code": 200, "message": "OK"}, "headers": {}, "body": {"string": "{}"}}
+    path.write_text(
+        json.dumps(
+            {
+                "_metadata": {"recorder": "keboola.vcr.proxy"},
+                "version": 1,
+                "interactions": [
+                    {
+                        "request": {
+                            "method": "PUT",
+                            "uri": UPLOAD_URL,
+                            "body": base64.b64encode(GZIP_CHUNK).decode(),
+                            "body_encoding": "base64",
+                            "headers": {"Content-Type": ["application/octet-stream"]},
+                        },
+                        "response": ok,
+                    },
+                    {
+                        "request": {
+                            "method": "POST",
+                            "uri": "https://api.example.com/q",
+                            "body": '{"q": 1}',
+                            "headers": {"Content-Type": ["application/json"]},
+                        },
+                        "response": ok,
+                    },
+                ],
+            }
+        )
+    )
+    s = _session(tmp_path, "replay")
+    assert s.replay(Request("PUT", UPLOAD_URL, GZIP_CHUNK, OCTET)) is not None
+    assert s.replay(Request("POST", "https://api.example.com/q", b'{"q":1}', {"Content-Type": "application/json"}))
+    assert s.unused_count() == 0
+
+
 def test_replay_without_cassette_fails_clearly(tmp_path):
     with pytest.raises(FileNotFoundError, match="Record it first"):
         _session(tmp_path, "replay")
@@ -316,6 +423,16 @@ class _Upstream(BaseHTTPRequestHandler):
         type(self).hits += 1
         body = json.dumps({"path": self.path, "token": SECRET}).encode()
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_PUT(self):
+        type(self).hits += 1
+        size = len(self.rfile.read(int(self.headers["Content-Length"])))
+        body = json.dumps({"received": size}).encode()
+        self.send_response(202)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -373,6 +490,15 @@ class _Proxy:
         except urllib.error.HTTPError as e:
             return e.code, e.read()
 
+    def put(self, url: str, body: bytes) -> tuple[int, bytes]:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{self.port}"}))
+        req = urllib.request.Request(url, data=body, method="PUT", headers=OCTET)
+        try:
+            with opener.open(req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
     def head_length(self, url: str) -> str | None:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{self.port}"}))
         with opener.open(urllib.request.Request(url, method="HEAD"), timeout=10) as r:
@@ -401,8 +527,9 @@ def test_mitmproxy_record_then_offline_replay(tmp_path, monkeypatch):
         assert status == 200
         assert json.loads(body)["token"] == SECRET  # the component sees the live answer while recording
         assert recorder.head_length(url.replace("/items", "/file.csv")) == "97"
+        assert recorder.put(url.replace("/items", "/uploadSession"), GZIP_CHUNK)[0] == 202
         result = recorder.control_call("POST", "/stop")
-        assert result["recorded"] == 2, result
+        assert result["recorded"] == 3, result
     finally:
         recorder.stop()
     upstream.shutdown()
@@ -417,6 +544,8 @@ def test_mitmproxy_record_then_offline_replay(tmp_path, monkeypatch):
         assert status == 200
         assert json.loads(body) == {"path": "/items?page=1", "token": "REDACTED"}
         assert replayer.head_length(url.replace("/items", "/file.csv")) == "97"  # not 0: HEAD has no body
+        upload = url.replace("/items", "/uploadSession")
+        assert replayer.put(upload, GZIP_CHUNK) == (202, json.dumps({"received": len(GZIP_CHUNK)}).encode())
         status, body = replayer.get(url.replace("page=1", "page=2"))
         assert status == 418
         assert b"no recorded interaction matches" in body
