@@ -86,6 +86,11 @@ python -m keboola.vcr.proxy --mode replay --config tests/vcr.json --confdir /vcr
   default). Each interaction plays once, in recorded order among equal requests.
 - **Binary bodies** (file downloads, uploads) bypass the text sanitizers and are stored base64-encoded, with
   `"encoding": "base64"` next to the body.
+- **Check what the component reads before you sanitize.** `DefaultSanitizer` keeps only the `content-type`,
+  `content-length` and `accept` response headers, and it redacts any body field named `code`. A component that polls
+  an async operation needs `"additional_safe_headers": ["location", "retry-after"]`; one that branches on an API
+  error code (`{"error": {"code": ...}}`) needs `sensitive_fields` without `code`. Otherwise replay takes a
+  different branch than the recording did.
 - **No time freezing:** a request whose URL or body carries the current date will not match on replay. Pin such
   values in the test config.
 
