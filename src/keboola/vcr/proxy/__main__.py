@@ -48,6 +48,7 @@ async def _run(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logging.getLogger("mitmproxy").setLevel(logging.WARNING)  # per-connection lines are noise in test logs
     asyncio.run(_run(parse_args(argv)))
 
 
