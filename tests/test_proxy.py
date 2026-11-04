@@ -17,7 +17,7 @@ import pytest
 from vcr.request import Request
 
 from keboola.vcr.proxy import CassetteSession, ProxyConfig, ProxyConfigError, RecordingError, SecretLeakError
-from keboola.vcr.proxy.cassette import response_parts
+from keboola.vcr.proxy.cassette import bodyless_content_length, response_parts
 from keboola.vcr.sanitizers import DefaultSanitizer
 
 SECRET = "s3cr3t-refresh-token-value"
@@ -305,6 +305,13 @@ class _Upstream(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def do_HEAD(self):
+        type(self).hits += 1
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv")
+        self.send_header("Content-Length", "97")
+        self.end_headers()
+
     def do_GET(self):
         type(self).hits += 1
         body = json.dumps({"path": self.path, "token": SECRET}).encode()
@@ -366,6 +373,11 @@ class _Proxy:
         except urllib.error.HTTPError as e:
             return e.code, e.read()
 
+    def head_length(self, url: str) -> str | None:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{self.port}"}))
+        with opener.open(urllib.request.Request(url, method="HEAD"), timeout=10) as r:
+            return r.headers.get("Content-Length")
+
     def stop(self):
         self.loop.call_soon_threadsafe(self.master.shutdown)
         self._thread.join(timeout=10)
@@ -388,8 +400,9 @@ def test_mitmproxy_record_then_offline_replay(tmp_path, monkeypatch):
         status, body = recorder.get(url)
         assert status == 200
         assert json.loads(body)["token"] == SECRET  # the component sees the live answer while recording
+        assert recorder.head_length(url.replace("/items", "/file.csv")) == "97"
         result = recorder.control_call("POST", "/stop")
-        assert result["recorded"] == 1, result
+        assert result["recorded"] == 2, result
     finally:
         recorder.stop()
     upstream.shutdown()
@@ -403,6 +416,7 @@ def test_mitmproxy_record_then_offline_replay(tmp_path, monkeypatch):
         status, body = replayer.get(url)
         assert status == 200
         assert json.loads(body) == {"path": "/items?page=1", "token": "REDACTED"}
+        assert replayer.head_length(url.replace("/items", "/file.csv")) == "97"  # not 0: HEAD has no body
         status, body = replayer.get(url.replace("page=1", "page=2"))
         assert status == 418
         assert b"no recorded interaction matches" in body
@@ -484,3 +498,12 @@ def test_body_pattern_sanitizer_from_config_redacts_xml(tmp_path):
     s.record(Request("POST", "https://sts.amazonaws.com/", b"Action=AssumeRole", {}), _resp(sts, ctype="text/xml"))
     s.write("test")
     assert "live-session-token" not in s.path.read_text()
+
+
+def test_bodyless_content_length_kept_for_head_204_304_only():
+    recorded = {"status": {"code": 200}, "headers": {"Content-Length": ["97"]}, "body": {"string": ""}}
+    assert bodyless_content_length(recorded, "HEAD") == "97"
+    assert bodyless_content_length(recorded, "GET") is None
+    not_modified = {"status": {"code": 304}, "headers": {"content-length": ["12"]}, "body": {"string": ""}}
+    assert bodyless_content_length(not_modified, "GET") == "12"
+    assert bodyless_content_length({"status": {"code": 200}, "headers": {}, "body": {}}, "HEAD") is None

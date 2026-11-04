@@ -23,7 +23,7 @@ from mitmproxy import http
 
 from vcr.request import Request
 
-from .cassette import CassetteSession, RecordingError, response_parts
+from .cassette import CassetteSession, RecordingError, bodyless_content_length, response_parts
 from .config import ProxyConfig
 
 logger = logging.getLogger("keboola.vcr.proxy")
@@ -152,6 +152,9 @@ class VcrProxyAddon:
         status, reason, headers, content = response_parts(recorded)
         response = http.Response.make(status, content, http.Headers(headers))
         response.reason = reason
+        content_length = bodyless_content_length(recorded, flow.request.method)
+        if content_length is not None:
+            response.headers["content-length"] = content_length
         flow.response = response
 
     def response(self, flow: http.HTTPFlow) -> None:

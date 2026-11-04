@@ -344,3 +344,19 @@ def response_parts(response: dict[str, Any]) -> tuple[int, str, list[tuple[bytes
         for v in values
     ]
     return int(status.get("code", 200)), str(status.get("message", "")), headers, content
+
+
+def bodyless_content_length(response: dict[str, Any], method: str) -> str | None:
+    """The recorded Content-Length to send with a replayed answer that has no body by definition.
+
+    A HEAD answer (and a 204 or 304) carries the size of the resource without its body. On replay mitmproxy would set
+    Content-Length to the length of the empty body, 0, and clients that read the size from a HEAD (S3 `headObject`)
+    would see 0 bytes. Returns None when the recorded value should not be kept.
+    """
+    status = int(response.get("status", {}).get("code", 200))
+    if method.upper() != "HEAD" and status not in (204, 304):
+        return None
+    for name, values in _header_lists(response.get("headers", {})).items():
+        if name.lower() == "content-length" and values:
+            return values[0]
+    return None
