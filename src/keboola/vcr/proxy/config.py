@@ -82,14 +82,21 @@ class UrlScopedSanitizer(_san.BaseSanitizer):
 class MatchOptions:
     """How a replayed request is matched to a recorded one.
 
-    Method, scheme, host, port, path and the sorted query always take part. Headers never do: they carry
-    authorization and signatures that differ between recording and replay.
+    Method, scheme, host, port, path and the sorted query always take part. Headers do not by default: they carry
+    authorization and signatures that differ between recording and replay. ``headers`` names request headers that
+    do take part (case-insensitive; a missing header compares as empty), for a client that sends requests which differ
+    only in a header, possibly at the same time (Azure Cosmos DB marks its query-plan request with
+    ``x-ms-cosmos-is-query-plan-request``). The recording must keep them: list them in ``additional_safe_headers``.
     """
 
     body: bool = True
     ignore_body: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE_BODY))
     ignore_body_fields: list[str] = field(default_factory=list)
     allow_playback_repeats: bool = False
+    headers: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.headers = [h.lower() for h in self.headers]
 
     def body_ignored_for(self, host: str, path: str) -> bool:
         target = f"{host}{path}"
@@ -119,9 +126,18 @@ class ProxyConfig:
         if unknown:
             raise ProxyConfigError(f"{source}: unknown keys {sorted(unknown)}")
         match_raw = dict(raw.get("match") or {})
-        unknown_match = set(match_raw) - {"body", "ignore_body", "ignore_body_fields", "allow_playback_repeats"}
+        unknown_match = set(match_raw) - {
+            "body",
+            "ignore_body",
+            "ignore_body_fields",
+            "allow_playback_repeats",
+            "headers",
+        }
         if unknown_match:
             raise ProxyConfigError(f"{source}: unknown keys in 'match': {sorted(unknown_match)}")
+        match_headers = match_raw.get("headers", [])
+        if not isinstance(match_headers, list) or not all(isinstance(h, str) and h.strip() for h in match_headers):
+            raise ProxyConfigError(f"{source}: 'match.headers' must be a list of header names")
         # Extra ignore_body patterns add to the defaults; they never silently drop the token endpoints.
         match_raw["ignore_body"] = DEFAULT_IGNORE_BODY + list(match_raw.get("ignore_body", []))
         specs = list(raw.get("sanitizers") or [])

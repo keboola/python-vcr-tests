@@ -77,6 +77,11 @@ def _first_header(headers: dict[str, Any], name: str) -> str:
     return ""
 
 
+def _match_header_values(headers: Any, names: list[str]) -> tuple[str, ...]:
+    """The values of the ``match.headers`` names (lower-case) in order; a missing header is empty."""
+    return tuple(_first_header(dict(headers or {}), name) for name in names)
+
+
 @dataclass
 class Interaction:
     """One request/response pair as the cassette stores it (sanitized)."""
@@ -224,10 +229,6 @@ class CassetteSession:
             clean.body = raw_body
         return clean
 
-    def _sanitized_key(self, req: Request) -> RequestKey:
-        """Sanitize a copy so the incoming request looks like the recorded (sanitized) one."""
-        return request_key(self._sanitize_request(req))
-
     @staticmethod
     def _recorded_key(interaction: Interaction) -> RequestKey:
         req = interaction.request
@@ -248,18 +249,28 @@ class CassetteSession:
 
     def replay(self, req: Request) -> dict[str, Any] | None:
         """Return the recorded response for ``req``, or None (and remember the miss)."""
-        incoming = self._sanitized_key(req)
+        # Sanitize a copy so the incoming request looks like the recorded (sanitized) one.
+        clean = self._sanitize_request(req)
+        if clean is None:  # a sanitizer drops this request, so it was never recorded
+            self.unmatched.append(f"{request_key(req).describe()} (not recorded: a sanitizer drops it)")
+            return None
+        incoming = request_key(clean)
+        names = self.match.headers
+        incoming_headers = _match_header_values(clean.headers, names)
         candidates = [
             i
             for i in self.interactions
-            if incoming.same_target(rk := self._recorded_key(i)) and self._bodies_match(incoming, rk)
+            if incoming.same_target(rk := self._recorded_key(i))
+            and self._bodies_match(incoming, rk)
+            and _match_header_values(i.request.get("headers"), names) == incoming_headers
         ]
         chosen = next((i for i in candidates if not i.played), None)
         if chosen is None and candidates and self.match.allow_playback_repeats:
             chosen = candidates[-1]
         if chosen is None:
             reason = "all matching interactions already played" if candidates else "no recorded interaction matches"
-            self.unmatched.append(f"{incoming.describe()} ({reason})")
+            shown = "".join(f" [{n}: {v}]" for n, v in zip(names, incoming_headers, strict=True) if v)
+            self.unmatched.append(f"{incoming.describe()}{shown} ({reason})")
             return None
         chosen.played = True
         return chosen.response
@@ -298,6 +309,18 @@ class CassetteSession:
         clean_req = self._sanitize_request(req)
         if clean_req is None:
             return
+        names = self.match.headers
+        for name, sent, kept in zip(
+            names,
+            _match_header_values(req.headers, names),
+            _match_header_values(clean_req.headers, names),
+            strict=True,
+        ):
+            if sent and not kept:
+                self.errors.append(
+                    f"match header {name} was removed by a sanitizer, so replay could never match "
+                    f"{request_key(req).describe()}; add it to DefaultSanitizer additional_safe_headers in vcr.json"
+                )
         chain = self._chain(req.uri)
         response = copy.deepcopy(response)
         raw_resp_body = response.get("body", {}).get("string")
