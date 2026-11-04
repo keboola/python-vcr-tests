@@ -36,6 +36,7 @@ from .recorder import (
 from .sanitizers import (
     BaseSanitizer,
     BodyFieldSanitizer,
+    BodyPatternSanitizer,
     CallbackSanitizer,
     CompositeSanitizer,
     ConfigSecretsSanitizer,
@@ -67,6 +68,7 @@ from .validator import (
 __all__ = [
     "BaseSanitizer",
     "BodyFieldSanitizer",
+    "BodyPatternSanitizer",
     "CallbackSanitizer",
     "CapturedLog",
     "CassetteMissingError",

@@ -684,6 +684,61 @@ class UrlPatternSanitizer(BaseSanitizer):
         return request
 
 
+class BodyPatternSanitizer(BaseSanitizer):
+    """
+    Replaces regex matches in request and response bodies (text only).
+
+    For values that sit in a body format the field-based sanitizers do not parse, such as XML
+    (``<SessionToken>...</SessionToken>`` in an AWS STS answer) or plain text. Bodies that are not valid UTF-8 are
+    left as they are.
+
+    Example:
+        BodyPatternSanitizer(patterns=[
+            (r"<SessionToken>[^<]*</SessionToken>", "<SessionToken>REDACTED</SessionToken>"),
+        ])
+    """
+
+    def __init__(self, patterns: list[tuple], scrub_before_read: bool = False):
+        """
+        Args:
+            patterns: List of (pattern, replacement) tuples; ``re.sub`` semantics, so groups like ``\\1`` work.
+        """
+        self._raw_patterns = patterns  # stored for merge()
+        self.patterns = [(re.compile(p), r) for p, r in patterns]
+        self.scrub_before_read = scrub_before_read
+        self.replacement = ""
+
+    def merge(self, other: BodyPatternSanitizer) -> BodyPatternSanitizer:
+        """Merge two BodyPatternSanitizers into one, unioning their pattern lists."""
+        combined = list(dict.fromkeys([tuple(p) for p in self._raw_patterns + other._raw_patterns]))
+        return BodyPatternSanitizer(patterns=combined, scrub_before_read=self.scrub_before_read)
+
+    def _sanitize(self, body: Any) -> Any:
+        if isinstance(body, bytes):
+            try:
+                text = body.decode("utf-8")
+            except UnicodeDecodeError:
+                return body
+            return self._sanitize(text).encode("utf-8")
+        if isinstance(body, str):
+            for pattern, replacement in self.patterns:
+                body = pattern.sub(replacement, body)
+        return body
+
+    def before_record_request(self, request: Any) -> Any:
+        """Apply the patterns to the request body."""
+        if getattr(request, "body", None):
+            request.body = self._sanitize(request.body)
+        return request
+
+    def before_record_response(self, response: dict) -> dict:
+        """Apply the patterns to the response body."""
+        body = response.get("body")
+        if isinstance(body, dict) and body.get("string"):
+            body["string"] = self._sanitize(body["string"])
+        return response
+
+
 def IPv4UrlSanitizer(replacement: str = "https://REDACTED-IPV4") -> UrlPatternSanitizer:
     """
     Returns a UrlPatternSanitizer that replaces IPv4 addresses in request URIs
