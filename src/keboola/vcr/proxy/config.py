@@ -43,6 +43,7 @@ _SANITIZER_FACTORIES: dict[str, Any] = {
     "BodyFieldSanitizer": _san.BodyFieldSanitizer,
     "QueryParamSanitizer": _san.QueryParamSanitizer,
     "UrlPatternSanitizer": _san.UrlPatternSanitizer,
+    "BodyPatternSanitizer": _san.BodyPatternSanitizer,
     "IPv4UrlSanitizer": _san.IPv4UrlSanitizer,
     "ResponseUrlSanitizer": _san.ResponseUrlSanitizer,
 }
@@ -168,7 +169,7 @@ class ProxyConfig:
                 default_kwargs = kwargs
                 continue
             urls = kwargs.pop("urls", None)
-            if spec["class"] == "UrlPatternSanitizer":
+            if spec["class"] in ("UrlPatternSanitizer", "BodyPatternSanitizer"):
                 kwargs["patterns"] = [tuple(p) for p in kwargs.get("patterns", [])]
             sanitizer = _SANITIZER_FACTORIES[spec["class"]](**kwargs)
             rest.append(UrlScopedSanitizer(sanitizer, urls) if urls else sanitizer)

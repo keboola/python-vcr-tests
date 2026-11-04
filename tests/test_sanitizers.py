@@ -535,3 +535,49 @@ class TestScrubBeforeReadFlag:
         result = _dedup_sanitizers([a, b])
         assert len(result) == 1
         assert result[0].scrub_before_read is True
+
+
+class TestBodyPatternSanitizer:
+    STS = (
+        "<AssumeRoleResponse><Credentials><AccessKeyId>ASIAEXAMPLE</AccessKeyId>"
+        "<SecretAccessKey>s3cr3t/value+x</SecretAccessKey><SessionToken>FwoGZX...long</SessionToken>"
+        "</Credentials></AssumeRoleResponse>"
+    )
+    PATTERNS = (
+        (r"<SecretAccessKey>[^<]*</SecretAccessKey>", "<SecretAccessKey>REDACTED</SecretAccessKey>"),
+        (r"<SessionToken>[^<]*</SessionToken>", "<SessionToken>REDACTED</SessionToken>"),
+    )
+
+    def test_response_body_bytes_and_str(self):
+        from keboola.vcr.sanitizers import BodyPatternSanitizer
+
+        s = BodyPatternSanitizer(patterns=list(self.PATTERNS))
+        for body in (self.STS.encode(), self.STS):
+            out = s.before_record_response({"body": {"string": body}})["body"]["string"]
+            text = out.decode() if isinstance(out, bytes) else out
+            assert "s3cr3t" not in text and "FwoGZX" not in text
+            assert "<AccessKeyId>ASIAEXAMPLE</AccessKeyId>" in text
+            assert isinstance(out, type(body))
+
+    def test_request_body_and_groups(self):
+        from types import SimpleNamespace
+
+        from keboola.vcr.sanitizers import BodyPatternSanitizer
+
+        s = BodyPatternSanitizer(patterns=[(r"(token=)[^&]+", r"\1REDACTED")])
+        req = s.before_record_request(SimpleNamespace(body=b"a=1&token=abc&b=2"))
+        assert req.body == b"a=1&token=REDACTED&b=2"
+
+    def test_binary_body_untouched(self):
+        from keboola.vcr.sanitizers import BodyPatternSanitizer
+
+        blob = bytes(range(256))
+        s = BodyPatternSanitizer(patterns=[(r".", "x")])
+        assert s.before_record_response({"body": {"string": blob}})["body"]["string"] == blob
+
+    def test_merge(self):
+        from keboola.vcr.sanitizers import BodyPatternSanitizer
+
+        a = BodyPatternSanitizer(patterns=[("a", "b")])
+        merged = a.merge(BodyPatternSanitizer(patterns=[("a", "b"), ("c", "d")]))
+        assert [p.pattern for p, _ in merged.patterns] == ["a", "c"]

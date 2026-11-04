@@ -466,3 +466,21 @@ def test_url_scoped_sanitizer_config_errors():
         ProxyConfig.from_dict({"sanitizers": [{"class": "BodyFieldSanitizer", "fields": ["x"], "urls": []}]})
     with pytest.raises(ProxyConfigError):
         ProxyConfig.from_dict({"sanitizers": [{"class": "DefaultSanitizer", "urls": ["a/b"]}]})
+
+
+def test_body_pattern_sanitizer_from_config_redacts_xml(tmp_path):
+    cfg = ProxyConfig.from_dict(
+        {
+            "sanitizers": [
+                {
+                    "class": "BodyPatternSanitizer",
+                    "patterns": [["<SessionToken>[^<]*</SessionToken>", "<SessionToken>REDACTED</SessionToken>"]],
+                }
+            ]
+        }
+    )
+    s = _session(tmp_path, "record", config=cfg)
+    sts = "<Credentials><SessionToken>live-session-token</SessionToken></Credentials>"
+    s.record(Request("POST", "https://sts.amazonaws.com/", b"Action=AssumeRole", {}), _resp(sts, ctype="text/xml"))
+    s.write("test")
+    assert "live-session-token" not in s.path.read_text()
