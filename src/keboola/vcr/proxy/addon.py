@@ -22,7 +22,7 @@ from mitmproxy import http
 
 from vcr.request import Request
 
-from .cassette import CassetteSession, SecretLeakError, response_parts
+from .cassette import CassetteSession, RecordingError, response_parts
 from .config import ProxyConfig
 
 logger = logging.getLogger("keboola.vcr.proxy")
@@ -102,7 +102,7 @@ class VcrProxyAddon:
         if self.mode == "record":
             try:
                 result["recorded"] = session.write(_version())
-            except SecretLeakError as e:
+            except RecordingError as e:
                 result["error"] = str(e)
         else:
             result["unused"] = session.unused_count()
@@ -146,16 +146,21 @@ class VcrProxyAddon:
             session = self._session
         if session is None:
             return  # traffic outside a test case (fixture set-up) passes through unrecorded
-        live = flow_to_response(flow)
-        scrubbed = session.scrub_for_client(live)
-        if scrubbed is not None:
-            content = response_parts(scrubbed)[3]
-            flow.response.headers.pop("content-encoding", None)
-            flow.response.content = content
-            live = scrubbed
-        with self._lock:
-            if self._session is session:
-                session.record(flow_to_request(flow), live)
+        try:
+            request = flow_to_request(flow)
+            session.check_no_placeholder_sent(request)
+            live = flow_to_response(flow)
+            scrubbed = session.scrub_for_client(live)
+            if scrubbed is not None:
+                content = response_parts(scrubbed)[3]
+                flow.response.headers.pop("content-encoding", None)
+                flow.response.content = content
+                live = scrubbed
+            with self._lock:
+                if self._session is session:
+                    session.record(request, live)
+        except Exception as e:  # noqa: BLE001  # a lost interaction must fail the case at /stop, not vanish in a log
+            session.errors.append(f"recording {flow.request.method} {flow.request.pretty_host} failed: {e!r}")
 
     # -- control server -------------------------------------------------------------------------------------
 

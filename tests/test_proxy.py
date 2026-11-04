@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from vcr.request import Request
 
-from keboola.vcr.proxy import CassetteSession, ProxyConfig, ProxyConfigError, SecretLeakError
+from keboola.vcr.proxy import CassetteSession, ProxyConfig, ProxyConfigError, RecordingError, SecretLeakError
 from keboola.vcr.proxy.cassette import response_parts
 from keboola.vcr.sanitizers import DefaultSanitizer
 
@@ -412,3 +412,30 @@ def test_mitmproxy_record_then_offline_replay(tmp_path, monkeypatch):
     finally:
         replayer.stop()
     assert _Upstream.hits == hits_after_record  # replay never reached the (stopped) upstream
+
+
+def test_secret_values_include_url_encoded_forms():
+    cfg = ProxyConfig.from_dict({"secret_env": ["T"]})
+    assert cfg.secret_values({"T": "a/b+c=="}) == ["a/b+c==", "a%2Fb%2Bc%3D%3D"]
+
+
+def test_url_encoded_secret_is_redacted(tmp_path):
+    raw = "0.AXs/abc+def=="
+    cfg = ProxyConfig.from_dict({"secret_env": ["T"]})
+    secrets = cfg.secret_values({"T": raw})
+    s = _session(tmp_path, "record", secrets=secrets)
+    s.record(Request("GET", "https://api.example.com/x?opaque=0.AXs%2Fabc%2Bdef%3D%3D", b"", {}), _resp("{}"))
+    s.write("test")
+    assert "abc%2Bdef" not in s.path.read_text()
+
+
+def test_placeholder_sent_back_fails_the_recording(tmp_path):
+    cfg = ProxyConfig.from_dict(
+        {"sanitizers": [{"class": "BodyFieldSanitizer", "fields": ["cursor"], "scrub_before_read": True}]}
+    )
+    s = _session(tmp_path, "record", config=cfg)
+    s.check_no_placeholder_sent(Request("GET", "https://api.example.com/items?cursor=REDACTED", b"", {}))
+    s.record(Request("GET", "https://api.example.com/items?cursor=REDACTED", b"", {}), _resp("{}"))
+    with pytest.raises(RecordingError, match="round-tripped"):
+        s.write("test")
+    assert not s.path.exists()

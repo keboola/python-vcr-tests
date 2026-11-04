@@ -4,7 +4,7 @@ Install with the ``proxy`` extra (``pip install "keboola.vcr[proxy]"``) and run 
 The cassette logic (:mod:`.cassette`, :mod:`.config`) does not need mitmproxy; only :mod:`.addon` does.
 """
 
-from .cassette import CassetteSession, SecretLeakError
+from .cassette import CassetteSession, RecordingError, SecretLeakError
 from .config import DEFAULT_IGNORE_BODY, MatchOptions, ProxyConfig, ProxyConfigError
 
 __all__ = [
@@ -13,5 +13,6 @@ __all__ = [
     "MatchOptions",
     "ProxyConfig",
     "ProxyConfigError",
+    "RecordingError",
     "SecretLeakError",
 ]

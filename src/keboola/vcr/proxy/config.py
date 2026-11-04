@@ -21,6 +21,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 from .. import sanitizers as _san
 
@@ -113,9 +114,20 @@ class ProxyConfig:
         )
 
     def secret_values(self, environ: dict[str, str] | None = None) -> list[str]:
-        """Values of the declared secret env vars that are set. Never logged."""
+        """Values of the declared secret env vars that are set, plus their URL-encoded forms. Never logged.
+
+        A token often travels URL-encoded (a form body, a query string), where the raw value does not occur.
+        """
         env = os.environ if environ is None else environ
-        return [env[name] for name in self.secret_env if env.get(name)]
+        values: list[str] = []
+        for name in self.secret_env:
+            raw = env.get(name)
+            if not raw:
+                continue
+            for variant in (raw, quote(raw, safe=""), quote_plus(raw, safe="")):
+                if variant not in values:
+                    values.append(variant)
+        return values
 
     def build_sanitizers(self, secret_values: list[str]) -> list[_san.BaseSanitizer]:
         """DefaultSanitizer first (with the secret values), then the declared ones in order."""

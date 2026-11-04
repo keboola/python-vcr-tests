@@ -28,7 +28,11 @@ RECORDER_NAME = "keboola.vcr.proxy"
 _FRAMING_HEADERS = {"content-length", "transfer-encoding", "content-encoding", "connection"}
 
 
-class SecretLeakError(RuntimeError):
+class RecordingError(RuntimeError):
+    """The recording of a case is not trustworthy; the cassette is not written."""
+
+
+class SecretLeakError(RecordingError):
     """A declared secret value is still present in the sanitized cassette."""
 
 
@@ -158,12 +162,17 @@ class CassetteSession:
     secret_values: list[str] = field(default_factory=list)
     interactions: list[Interaction] = field(default_factory=list)
     unmatched: list[str] = field(default_factory=list)
+    # Problems found while recording; /stop reports them and the PHP hook fails the case.
+    errors: list[str] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:
         self._chain = CompositeSanitizer(self.sanitizers)
         self._pre_read = CompositeSanitizer([s for s in self.sanitizers if getattr(s, "scrub_before_read", False)])
         self._has_pre_read = bool(self._pre_read.sanitizers)
+        self._pre_read_placeholders = {
+            p for p in (getattr(x, "replacement", "") for x in self._pre_read.sanitizers) if isinstance(p, str) and p
+        }
         if self.mode == "replay":
             self._load()
 
@@ -225,6 +234,25 @@ class CassetteSession:
             return None
         return self._pre_read.before_record_response(copy.deepcopy(response))
 
+    def check_no_placeholder_sent(self, req: Request) -> None:
+        """Remember an error when the client sends a scrub_before_read placeholder back to the live API.
+
+        Same rule as VCRRecorder: a tagged field that the component round-trips (a cursor, an id, a token) breaks the
+        live follow-up request, so the recording would be wrong.
+        """
+        if not self._pre_read_placeholders:
+            return
+        text, _ = body_to_text(req.body)
+        haystack = f"{req.uri}\n{text or ''}"
+        for placeholder in self._pre_read_placeholders:
+            esc = re.escape(placeholder)
+            if re.search(rf"=\s*{esc}(?=[&\s\"']|$)", haystack) or re.search(rf'"{esc}"', haystack):
+                self.errors.append(
+                    f"a scrub_before_read sanitizer redacted a value that the client sent back to the API "
+                    f"({request_key(req).describe()}); untag the round-tripped field in vcr.json"
+                )
+                return
+
     def record(self, req: Request, response: dict[str, Any]) -> None:
         # Sanitizers work on text and would corrupt binary bodies (file downloads, uploads), so a binary body
         # bypasses them and is stored base64-encoded as it is. The leak check in write() still covers the text.
@@ -274,6 +302,8 @@ class CassetteSession:
 
     def write(self, version: str) -> int:
         """Write the cassette. Refuses (SecretLeakError) if a declared secret value survived sanitizing."""
+        if self.errors:
+            raise RecordingError(f"Refusing to write {self.path}: " + "; ".join(self.errors))
         text = self.serialize(version)
         leaked = [i for i, value in enumerate(self.secret_values) if value and value in text]
         if leaked:
