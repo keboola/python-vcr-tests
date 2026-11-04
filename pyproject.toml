@@ -21,6 +21,12 @@ dependencies = [
     "typing-extensions>=4; python_version < '3.11'",  # typing.Self backport for db_recorder __enter__ annotations
 ]
 
+[project.optional-dependencies]
+# Record/replay HTTPS proxy for non-Python components (python -m keboola.vcr.proxy). mitmproxy 12 needs Python 3.12+.
+proxy = [
+    "mitmproxy>=12.3,<13; python_version >= '3.12'",
+]
+
 [build-system]
 requires = ["uv_build >= 0.10.0, <0.11.0"]
 build-backend = "uv_build"
