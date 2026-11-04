@@ -22,6 +22,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--listen-host", default="0.0.0.0")
     p.add_argument("--listen-port", type=int, default=8080)
     p.add_argument("--control-port", type=int, default=8081)
+    # 0.0.0.0 so the test container reaches it over the compose network. It is an unauthenticated test helper:
+    # never publish the port to the host or run the proxy outside a test/CI network.
+    p.add_argument("--control-host", default="0.0.0.0")
     p.add_argument("--confdir", default=os.environ.get("VCR_CONFDIR", "~/.mitmproxy"), help="mitmproxy CA dir")
     return p.parse_args(argv)
 
@@ -35,7 +38,7 @@ async def _run(args: argparse.Namespace) -> None:
     config = ProxyConfig.load(args.config)
     opts = Options(listen_host=args.listen_host, listen_port=args.listen_port, confdir=args.confdir)
     master = DumpMaster(opts, with_termlog=True, with_dumper=False)
-    master.addons.add(VcrProxyAddon(args.mode, config, control_port=args.control_port))
+    master.addons.add(VcrProxyAddon(args.mode, config, control_port=args.control_port, control_host=args.control_host))
     if args.mode == "replay":
         # Offline: no upstream connection for certificate sniffing or eager connects.
         master.options.update(upstream_cert=False, connection_strategy="lazy")

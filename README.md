@@ -76,6 +76,9 @@ python -m keboola.vcr.proxy --mode replay --config tests/vcr.json --confdir /vcr
 - **Ports:** `8080` is the proxy. `8081` is the control port: `POST /start {"cassette": "<abs path>"}` starts a
   test case, `GET /status` reports it so far without ending it, `POST /stop` ends it (record mode writes the
   cassette; the answer lists `unmatched` requests in replay), `GET /health` answers once the proxy runs.
+- **Network:** both ports listen on `0.0.0.0` (`--listen-host`, `--control-host`) so the test container reaches them
+  over the compose network. The control port has no authentication: never publish it to the host or run the proxy
+  outside a test or CI network.
 - **Record** (`--mode record` or `VCR_MODE=record`): live traffic, sanitized before it is written. Traffic outside a
   started case (test fixture set-up) passes through and is not recorded. If a value of a `secret_env` variable is
   still in the cassette after sanitizing, the proxy refuses to write it and `/stop` returns an `error`.
