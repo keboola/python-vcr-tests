@@ -27,6 +27,8 @@ RECORDER_NAME = "keboola.vcr.proxy"
 # changed), so a stale recorded value must never reach the client.
 _FRAMING_HEADERS = {"content-length", "transfer-encoding", "content-encoding", "connection"}
 
+_BOUNDARY_RE = re.compile(r"boundary=\"?([^\";]+)\"?", re.IGNORECASE)
+
 
 class RecordingError(RuntimeError):
     """The recording of a case is not trustworthy; the cassette is not written."""
@@ -90,7 +92,7 @@ class Interaction:
 class RequestKey:
     """The parts of a request that decide a match."""
 
-    def __init__(self, method: str, uri: str, body: str | None, content_type: str):
+    def __init__(self, method: str, uri: str, body: str | None, content_type: str, binary: bool = False):
         parts = urlsplit(uri)
         self.method = method.upper()
         self.scheme = parts.scheme.lower()
@@ -99,7 +101,12 @@ class RequestKey:
         self.path = parts.path or "/"
         self.query = sorted(parse_qsl(parts.query, keep_blank_values=True))
         self.body = body
+        # A binary body is held base64-encoded, the way the cassette stores it.
+        self.binary = binary
         self.content_type = content_type.lower()
+        # The multipart boundary is case-sensitive, so it is read from the header as sent.
+        boundary = _BOUNDARY_RE.search(content_type)
+        self.boundary = boundary.group(1) if boundary else None
 
     def describe(self) -> str:
         query = "&".join(f"{k}={v}" for k, v in self.query)
@@ -124,14 +131,19 @@ def _drop_fields(data: Any, names: set[str]) -> Any:
     return data
 
 
-_BOUNDARY_RE = re.compile(r"boundary=\"?([^\";]+)\"?", re.IGNORECASE)
-
-
 def normalized_body(key: RequestKey, ignore_fields: list[str]) -> Any:
-    """A comparable form of the body: parsed JSON, sorted form pairs, or the text with multipart boundaries masked."""
+    """A comparable form of the body: parsed JSON, sorted form pairs, or the text with multipart boundaries masked.
+
+    A binary body compares as its exact bytes (multipart boundary masked), never equal to a text body.
+    """
     body = key.body or ""
     if not body:
         return ""
+    if key.binary:
+        raw = base64.b64decode(body)
+        if key.boundary:
+            raw = raw.replace(key.boundary.encode("latin-1"), b"BOUNDARY")
+        return ("binary", raw)
     if "json" in key.content_type or body[:1] in "{[":
         try:
             return ("json", _drop_fields(json.loads(body), set(ignore_fields)))
@@ -140,15 +152,14 @@ def normalized_body(key: RequestKey, ignore_fields: list[str]) -> Any:
     if "x-www-form-urlencoded" in key.content_type:
         pairs = parse_qsl(body, keep_blank_values=True)
         return ("form", sorted((k, v) for k, v in pairs if k not in ignore_fields))
-    m = _BOUNDARY_RE.search(key.content_type)
-    if m:
-        return ("text", body.replace(m.group(1), "BOUNDARY"))
+    if key.boundary:
+        return ("text", body.replace(key.boundary, "BOUNDARY"))
     return ("text", body)
 
 
 def request_key(req: Request) -> RequestKey:
-    text, _ = body_to_text(req.body)
-    return RequestKey(req.method, req.uri, text, _first_header(dict(req.headers), "content-type"))
+    text, is_base64 = body_to_text(req.body)
+    return RequestKey(req.method, req.uri, text, _first_header(dict(req.headers), "content-type"), binary=is_base64)
 
 
 @dataclass
@@ -196,10 +207,26 @@ class CassetteSession:
         data = json.loads(self.path.read_text())
         self.interactions = [Interaction(i["request"], i["response"]) for i in data.get("interactions", [])]
 
+    def _sanitize_request(self, req: Request) -> Request | None:
+        """Run the request sanitizers on a copy of ``req``.
+
+        Sanitizers work on text and would corrupt a binary body (file uploads), so a binary body bypasses them and is
+        kept as it is. Recording and replay both go through here, so an incoming request is sanitized exactly like
+        the recorded one was.
+        """
+        req = copy.deepcopy(req)
+        raw_body = req.body
+        binary = _is_binary(raw_body)
+        if binary:
+            req.body = b""
+        clean = self._chain(req.uri).before_record_request(req)
+        if clean is not None and binary:
+            clean.body = raw_body
+        return clean
+
     def _sanitized_key(self, req: Request) -> RequestKey:
-        """Run the request sanitizers on a copy so the incoming request looks like the recorded (sanitized) one."""
-        clean = self._chain(req.uri).before_record_request(copy.deepcopy(req))
-        return request_key(clean)
+        """Sanitize a copy so the incoming request looks like the recorded (sanitized) one."""
+        return request_key(self._sanitize_request(req))
 
     @staticmethod
     def _recorded_key(interaction: Interaction) -> RequestKey:
@@ -210,6 +237,7 @@ class CassetteSession:
             req["uri"],
             body if isinstance(body, str) or body is None else str(body),
             _first_header(req.get("headers", {}), "content-type"),
+            binary=req.get("body_encoding") == "base64",
         )
 
     def _bodies_match(self, incoming: RequestKey, recorded: RequestKey) -> bool:
@@ -267,17 +295,10 @@ class CassetteSession:
     def record(self, req: Request, response: dict[str, Any]) -> None:
         # Sanitizers work on text and would corrupt binary bodies (file downloads, uploads), so a binary body
         # bypasses them and is stored base64-encoded as it is. The leak check in write() still covers the text.
-        req = copy.deepcopy(req)
-        req_binary = _is_binary(req.body)
-        raw_req_body = req.body
-        if req_binary:
-            req.body = b""
-        chain = self._chain(req.uri)
-        clean_req = chain.before_record_request(req)
+        clean_req = self._sanitize_request(req)
         if clean_req is None:
             return
-        if req_binary:
-            clean_req.body = raw_req_body
+        chain = self._chain(req.uri)
         response = copy.deepcopy(response)
         raw_resp_body = response.get("body", {}).get("string")
         resp_binary = _is_binary(raw_resp_body)
