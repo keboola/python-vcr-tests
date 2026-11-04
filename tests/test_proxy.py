@@ -178,7 +178,7 @@ def _recorded(tmp_path: Path, pairs: list[tuple[Request, dict]], config: ProxyCo
     s.write("test")
 
 
-def test_replay_matches_on_sorted_query_and_ignores_headers(tmp_path):
+def test_replay_matches_on_sorted_query_and_ignore_recorded_header_names(tmp_path):
     _recorded(
         tmp_path,
         [
@@ -270,6 +270,88 @@ def test_replay_plays_each_interaction_once_unless_repeats_allowed(tmp_path):
     s.replay(req)
     s.replay(req)
     assert json.loads(response_parts(s.replay(req))[3]) == {"n": 2}
+
+
+QUERY_PLAN = "x-ms-cosmos-is-query-plan-request"
+MATCH_PLAN_HEADER = {
+    "match": {"headers": ["X-MS-Cosmos-Is-Query-Plan-Request"]},
+    "sanitizers": [{"class": "DefaultSanitizer", "additional_safe_headers": [QUERY_PLAN]}],
+}
+
+
+def _query(plan: bool) -> Request:
+    headers = {"Content-Type": "application/query+json", "Authorization": "signed-per-request"}
+    if plan:
+        headers["x-ms-cosmos-is-query-plan-request"] = "True"
+    return Request(
+        "POST", "https://acc.documents.azure.com/dbs/d/colls/c/docs", b'{"query": "SELECT * FROM c"}', headers
+    )
+
+
+def test_config_match_headers_are_lower_cased_and_validated():
+    assert ProxyConfig.from_dict(MATCH_PLAN_HEADER).match.headers == [QUERY_PLAN]
+    assert ProxyConfig.from_dict({}).match.headers == []
+    with pytest.raises(ProxyConfigError, match="match.headers"):
+        ProxyConfig.from_dict({"match": {"headers": "x-a"}})
+    with pytest.raises(ProxyConfigError, match="match.headers"):
+        ProxyConfig.from_dict({"match": {"headers": [""]}})
+
+
+def test_replay_match_headers_tell_concurrent_identical_requests_apart(tmp_path):
+    # A client sends both at the same time; the recording keeps them in the order the answers came back, and replay
+    # sees them in the order they arrive, which can be the other way round.
+    cfg = ProxyConfig.from_dict(MATCH_PLAN_HEADER)
+    _recorded(
+        tmp_path,
+        [(_query(plan=False), _resp('{"Documents": [1]}')), (_query(plan=True), _resp('{"plan": 1}'))],
+        config=cfg,
+    )
+    assert QUERY_PLAN in _recorded_header_names(tmp_path, 1)
+    assert QUERY_PLAN not in _recorded_header_names(tmp_path, 0)
+    s = _session(tmp_path, "replay", config=cfg)
+    assert json.loads(response_parts(s.replay(_query(plan=True)))[3]) == {"plan": 1}
+    assert json.loads(response_parts(s.replay(_query(plan=False)))[3]) == {"Documents": [1]}
+    assert s.unused_count() == 0
+    assert s.replay(_query(plan=True)) is None
+    assert f"[{QUERY_PLAN}: True]" in s.unmatched[0]
+    assert "already played" in s.unmatched[0]
+
+
+def test_replay_without_match_headers_still_ignore_recorded_header_names(tmp_path):
+    # The default is unchanged: equal requests replay in recorded order, whatever their headers.
+    cfg = ProxyConfig.from_dict({"sanitizers": MATCH_PLAN_HEADER["sanitizers"]})
+    _recorded(
+        tmp_path,
+        [(_query(plan=False), _resp('{"Documents": [1]}')), (_query(plan=True), _resp('{"plan": 1}'))],
+        config=cfg,
+    )
+    s = _session(tmp_path, "replay", config=cfg)
+    assert json.loads(response_parts(s.replay(_query(plan=True)))[3]) == {"Documents": [1]}
+
+
+def test_replay_match_header_missing_on_both_sides_matches(tmp_path):
+    cfg = ProxyConfig.from_dict(MATCH_PLAN_HEADER)
+    _recorded(tmp_path, [(_query(plan=False), _resp('{"Documents": []}'))], config=cfg)
+    s = _session(tmp_path, "replay", config=cfg)
+    assert s.replay(_query(plan=True)) is None
+    assert "no recorded interaction matches" in s.unmatched[0]
+    assert s.replay(_query(plan=False)) is not None
+
+
+def test_record_fails_when_a_sanitizer_drops_a_match_header(tmp_path):
+    cfg = ProxyConfig.from_dict({"match": MATCH_PLAN_HEADER["match"]})
+    s = _session(tmp_path, "record", config=cfg)
+    s.record(_query(plan=False), _resp("{}"))
+    assert not s.errors  # the header was not sent, so nothing was lost
+    s.record(_query(plan=True), _resp("{}"))
+    with pytest.raises(RecordingError, match="additional_safe_headers"):
+        s.write("test")
+    assert not s.path.exists()
+
+
+def _recorded_header_names(tmp_path: Path, index: int) -> list[str]:
+    data = json.loads((tmp_path / "cassettes" / "requests.json").read_text())
+    return [k.lower() for k in data["interactions"][index]["request"]["headers"]]
 
 
 def test_replay_masks_multipart_boundaries(tmp_path):
@@ -428,6 +510,19 @@ class _Upstream(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        type(self).hits += 1
+        self.rfile.read(int(self.headers["Content-Length"]))
+        plan = self.headers.get("x-ms-cosmos-is-query-plan-request") == "True"
+        if not plan:
+            time.sleep(0.3)  # the plain query answers last, so it is recorded after the plan request
+        body = json.dumps({"kind": "plan" if plan else "docs"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_PUT(self):
         type(self).hits += 1
         size = len(self.rfile.read(int(self.headers["Content-Length"])))
@@ -499,6 +594,15 @@ class _Proxy:
         except urllib.error.HTTPError as e:
             return e.code, e.read()
 
+    def post(self, url: str, body: bytes, headers: dict[str, str]) -> tuple[int, bytes]:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{self.port}"}))
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        try:
+            with opener.open(req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
     def head_length(self, url: str) -> str | None:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{self.port}"}))
         with opener.open(urllib.request.Request(url, method="HEAD"), timeout=10) as r:
@@ -556,6 +660,56 @@ def test_mitmproxy_record_then_offline_replay(tmp_path, monkeypatch):
     finally:
         replayer.stop()
     assert _Upstream.hits == hits_after_record  # replay never reached the (stopped) upstream
+
+
+@pytest.mark.skipif(not HAS_MITMPROXY, reason="needs the proxy extra (mitmproxy, Python 3.12+)")
+def test_mitmproxy_concurrent_requests_that_differ_only_in_a_match_header(tmp_path):
+    config = ProxyConfig.from_dict(MATCH_PLAN_HEADER)
+    cassette = tmp_path / "case" / "cassettes" / "requests.json"
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{upstream.server_address[1]}/dbs/d/colls/c/docs"
+    body = b'{"query": "SELECT * FROM c"}'
+    plain = {"Content-Type": "application/query+json"}
+    plan = {**plain, "x-ms-cosmos-is-query-plan-request": "True"}
+
+    def both_at_once(proxy: _Proxy) -> dict[str, Any]:
+        results: dict[str, Any] = {}
+        threads = [
+            threading.Thread(target=lambda: results.__setitem__("plain", proxy.post(url, body, plain))),
+            threading.Thread(target=lambda: results.__setitem__("plan", proxy.post(url, body, plan))),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        return results
+
+    recorder = _Proxy("record", config, tmp_path / "ca")
+    try:
+        recorder.control_call("POST", "/start", {"cassette": str(cassette)})
+        recorded = both_at_once(recorder)
+        assert recorder.control_call("POST", "/stop")["recorded"] == 2
+    finally:
+        recorder.stop()
+    upstream.shutdown()
+    upstream.server_close()
+    assert json.loads(recorded["plan"][1]) == {"kind": "plan"}
+    # the slower plain query was recorded second, after the plan request
+    order = [i["response"]["body"]["string"] for i in json.loads(cassette.read_text())["interactions"]]
+    assert [json.loads(o)["kind"] for o in order] == ["plan", "docs"]
+
+    replayer = _Proxy("replay", config, tmp_path / "ca")
+    try:
+        for _ in range(5):
+            replayer.control_call("POST", "/start", {"cassette": str(cassette)})
+            got = both_at_once(replayer)
+            assert got["plain"] == (200, json.dumps({"kind": "docs"}).encode())
+            assert got["plan"] == (200, json.dumps({"kind": "plan"}).encode())
+            result = replayer.control_call("POST", "/stop")
+            assert result["unmatched"] == [] and result["unused"] == 0
+    finally:
+        replayer.stop()
 
 
 def test_secret_values_include_url_encoded_forms():

@@ -85,8 +85,10 @@ python -m keboola.vcr.proxy --mode replay --config tests/vcr.json --confdir /vcr
 - **Replay** (default): no upstream connection at all (`upstream_cert=false`, lazy connect). A request with no
   recorded answer gets HTTP 418 with an explanation and is listed in the `/stop` answer.
 - **Matching:** method, scheme, host, port, path and the sorted query, plus the JSON or form body (multipart
-  boundaries masked); never headers. The body is ignored on OAuth token endpoints (Google, Microsoft, Firebolt by
-  default). Each interaction plays once, in recorded order among equal requests.
+  boundaries masked); headers only when listed in `match.headers`. The body is ignored on OAuth token endpoints
+  (Google, Microsoft, Firebolt by default). Each interaction plays once, in recorded order among equal requests. The
+  proxy records an interaction when its answer comes back, so two equal requests sent at the same time can be
+  recorded in one order and replayed in the other; when a header tells them apart, list it in `match.headers`.
 - **Binary bodies** (file downloads, uploads) bypass the text sanitizers and are stored base64-encoded, with
   `"encoding": "base64"` next to the body. A binary request body matches on its exact bytes (multipart boundaries
   masked), so upload chunks need no `ignore_body` entry.
@@ -128,6 +130,7 @@ python -m keboola.vcr.proxy --mode replay --config tests/vcr.json --confdir /vcr
 | `match.ignore_body` | Extra `host/path` globs whose body is not matched (added to the token endpoint defaults) |
 | `match.ignore_body_fields` | JSON or form fields left out of the body comparison (request ids, timestamps) |
 | `match.allow_playback_repeats` | Reuse the last matching interaction once all are played |
+| `match.headers` | Request header names that take part in matching (case-insensitive; a missing header counts as empty). For requests that differ only in a header, such as the Azure Cosmos DB query-plan request (`x-ms-cosmos-is-query-plan-request`). Keep them in the recording with `DefaultSanitizer` `additional_safe_headers`; recording fails if a sanitizer removes one. Never list a header that carries a secret or a per-request signature |
 
 The PHP side (one trait for `keboola/datadir-tests`, a CA helper and a compose example) is
 [keboola/php-vcr-tests](https://github.com/keboola/php-vcr-tests). Validate recordings with the
