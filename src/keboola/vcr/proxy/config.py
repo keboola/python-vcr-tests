@@ -21,7 +21,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, urlsplit
 
 from .. import sanitizers as _san
 
@@ -50,6 +50,31 @@ _SANITIZER_FACTORIES: dict[str, Any] = {
 
 class ProxyConfigError(ValueError):
     """Raised for an invalid ``vcr.json``."""
+
+
+class UrlScopedSanitizer(_san.BaseSanitizer):
+    """Applies ``inner`` only to interactions whose request ``host/path`` matches one of ``urls`` (fnmatch globs).
+
+    For a field name that is personal data on one endpoint but a value the component needs on others (``name`` of a
+    SharePoint site vs. ``name`` of a file).
+    """
+
+    def __init__(self, inner: _san.BaseSanitizer, urls: list[str]):
+        self.inner = inner
+        self.urls = list(urls)
+        self.scrub_before_read = getattr(inner, "scrub_before_read", False)
+        self.replacement = getattr(inner, "replacement", "")
+
+    def applies_to(self, uri: str) -> bool:
+        parts = urlsplit(uri)
+        target = f"{(parts.hostname or '').lower()}{parts.path or '/'}"
+        return any(fnmatch.fnmatchcase(target, pattern) for pattern in self.urls)
+
+    def before_record_request(self, request: Any) -> Any:
+        return self.inner.before_record_request(request)
+
+    def before_record_response(self, response: dict) -> dict:
+        return self.inner.before_record_response(response)
 
 
 @dataclass
@@ -104,6 +129,10 @@ class ProxyConfig:
                 raise ProxyConfigError(
                     f"{source}: each sanitizer needs a 'class' from {sorted(_SANITIZER_FACTORIES)}, got {spec!r}"
                 )
+        for spec in specs:
+            urls = spec.get("urls")
+            if urls is not None and (spec["class"] == "DefaultSanitizer" or not isinstance(urls, list) or not urls):
+                raise ProxyConfigError(f"{source}: 'urls' must be a non-empty list, and not on DefaultSanitizer")
         if sum(1 for s in specs if s["class"] == "DefaultSanitizer") > 1:
             raise ProxyConfigError(f"{source}: declare DefaultSanitizer at most once")
         return cls(
@@ -138,8 +167,10 @@ class ProxyConfig:
             if spec["class"] == "DefaultSanitizer":
                 default_kwargs = kwargs
                 continue
+            urls = kwargs.pop("urls", None)
             if spec["class"] == "UrlPatternSanitizer":
                 kwargs["patterns"] = [tuple(p) for p in kwargs.get("patterns", [])]
-            rest.append(_SANITIZER_FACTORIES[spec["class"]](**kwargs))
+            sanitizer = _SANITIZER_FACTORIES[spec["class"]](**kwargs)
+            rest.append(UrlScopedSanitizer(sanitizer, urls) if urls else sanitizer)
         values = list(default_kwargs.pop("sensitive_values", [])) + list(secret_values)
         return [_san.DefaultSanitizer(sensitive_values=values, **default_kwargs), *rest]

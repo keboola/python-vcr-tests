@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, urlsplit
 from vcr.request import Request
 
 from ..sanitizers import BaseSanitizer, CompositeSanitizer
-from .config import MatchOptions
+from .config import MatchOptions, UrlScopedSanitizer
 
 RECORDER_NAME = "keboola.vcr.proxy"
 
@@ -167,14 +167,24 @@ class CassetteSession:
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:
-        self._chain = CompositeSanitizer(self.sanitizers)
-        self._pre_read = CompositeSanitizer([s for s in self.sanitizers if getattr(s, "scrub_before_read", False)])
-        self._has_pre_read = bool(self._pre_read.sanitizers)
+        pre_read = [s for s in self.sanitizers if getattr(s, "scrub_before_read", False)]
+        self._has_pre_read = bool(pre_read)
         self._pre_read_placeholders = {
-            p for p in (getattr(x, "replacement", "") for x in self._pre_read.sanitizers) if isinstance(p, str) and p
+            p for p in (getattr(x, "replacement", "") for x in pre_read) if isinstance(p, str) and p
         }
         if self.mode == "replay":
             self._load()
+
+    def _chain(self, uri: str, pre_read_only: bool = False) -> CompositeSanitizer:
+        """The sanitizers for one request URL: URL-scoped ones only where they apply."""
+        return CompositeSanitizer(
+            [
+                s
+                for s in self.sanitizers
+                if (not isinstance(s, UrlScopedSanitizer) or s.applies_to(uri))
+                and (not pre_read_only or getattr(s, "scrub_before_read", False))
+            ]
+        )
 
     # -- replay ---------------------------------------------------------------------------------------------
 
@@ -188,7 +198,7 @@ class CassetteSession:
 
     def _sanitized_key(self, req: Request) -> RequestKey:
         """Run the request sanitizers on a copy so the incoming request looks like the recorded (sanitized) one."""
-        clean = self._chain.before_record_request(copy.deepcopy(req))
+        clean = self._chain(req.uri).before_record_request(copy.deepcopy(req))
         return request_key(clean)
 
     @staticmethod
@@ -228,11 +238,12 @@ class CassetteSession:
 
     # -- record ---------------------------------------------------------------------------------------------
 
-    def scrub_for_client(self, response: dict[str, Any]) -> dict[str, Any] | None:
+    def scrub_for_client(self, response: dict[str, Any], uri: str) -> dict[str, Any] | None:
         """Apply scrub_before_read sanitizers to the live response before the component reads it."""
-        if not self._has_pre_read:
+        chain = self._chain(uri, pre_read_only=True) if self._has_pre_read else None
+        if chain is None or not chain.sanitizers:
             return None
-        return self._pre_read.before_record_response(copy.deepcopy(response))
+        return chain.before_record_response(copy.deepcopy(response))
 
     def check_no_placeholder_sent(self, req: Request) -> None:
         """Remember an error when the client sends a scrub_before_read placeholder back to the live API.
@@ -261,7 +272,8 @@ class CassetteSession:
         raw_req_body = req.body
         if req_binary:
             req.body = b""
-        clean_req = self._chain.before_record_request(req)
+        chain = self._chain(req.uri)
+        clean_req = chain.before_record_request(req)
         if clean_req is None:
             return
         if req_binary:
@@ -271,7 +283,7 @@ class CassetteSession:
         resp_binary = _is_binary(raw_resp_body)
         if resp_binary:
             response["body"]["string"] = b""
-        clean_resp = self._chain.before_record_response(response)
+        clean_resp = chain.before_record_response(response)
         if clean_resp is None:
             return
         if resp_binary:

@@ -165,7 +165,7 @@ class VcrProxyAddon:
             request = flow_to_request(flow)
             session.check_no_placeholder_sent(request)
             live = flow_to_response(flow)
-            scrubbed = session.scrub_for_client(live)
+            scrubbed = session.scrub_for_client(live, request.uri)
             if scrubbed is not None:
                 content = response_parts(scrubbed)[3]
                 flow.response.headers.pop("content-encoding", None)

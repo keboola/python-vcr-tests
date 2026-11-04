@@ -160,10 +160,10 @@ def test_scrub_before_read_redacts_client_copy(tmp_path):
         {"sanitizers": [{"class": "BodyFieldSanitizer", "fields": ["email"], "scrub_before_read": True}]}
     )
     s = _session(tmp_path, "record", config=cfg)
-    scrubbed = s.scrub_for_client(_resp(json.dumps({"email": "a@b.c", "id": 1})))
+    scrubbed = s.scrub_for_client(_resp(json.dumps({"email": "a@b.c", "id": 1})), "https://api.example.com/u")
     assert scrubbed is not None
     assert "a@b.c" not in str(scrubbed["body"]["string"])
-    assert _session(tmp_path, "record").scrub_for_client(_resp("{}")) is None
+    assert _session(tmp_path, "record").scrub_for_client(_resp("{}"), "https://api.example.com/u") is None
 
 
 # -- replay ---------------------------------------------------------------------------------------------------
@@ -440,3 +440,29 @@ def test_placeholder_sent_back_fails_the_recording(tmp_path):
     with pytest.raises(RecordingError, match="round-tripped"):
         s.write("test")
     assert not s.path.exists()
+
+
+def test_url_scoped_sanitizer_applies_only_to_matching_urls(tmp_path):
+    cfg = ProxyConfig.from_dict(
+        {
+            "sanitizers": [
+                {"class": "BodyFieldSanitizer", "fields": ["name"], "urls": ["graph.microsoft.com/v1.0/sites"]}
+            ]
+        }
+    )
+    s = _session(tmp_path, "record", config=cfg)
+    sites = Request("GET", "https://graph.microsoft.com/v1.0/sites?search=&$select=id,name", b"", {})
+    files = Request("GET", "https://graph.microsoft.com/v1.0/me/drive/root/children", b"", {})
+    s.record(sites, _resp(json.dumps({"value": [{"id": "s1", "name": "Some Site"}]})))
+    s.record(files, _resp(json.dumps({"value": [{"id": "f1", "name": "book.xlsx"}]})))
+    s.write("test")
+    text = s.path.read_text()
+    assert "Some Site" not in text
+    assert "book.xlsx" in text
+
+
+def test_url_scoped_sanitizer_config_errors():
+    with pytest.raises(ProxyConfigError):
+        ProxyConfig.from_dict({"sanitizers": [{"class": "BodyFieldSanitizer", "fields": ["x"], "urls": []}]})
+    with pytest.raises(ProxyConfigError):
+        ProxyConfig.from_dict({"sanitizers": [{"class": "DefaultSanitizer", "urls": ["a/b"]}]})

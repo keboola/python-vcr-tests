@@ -102,7 +102,8 @@ python -m keboola.vcr.proxy --mode replay --config tests/vcr.json --confdir /vcr
   "sanitizers": [
     {"class": "DefaultSanitizer", "additional_sensitive_fields": ["sessionId"]},
     {"class": "BodyFieldSanitizer", "fields": ["email"], "scrub_before_read": true},
-    {"class": "UrlPatternSanitizer", "patterns": [["/users/[0-9]+", "/users/0"]]}
+    {"class": "UrlPatternSanitizer", "patterns": [["/users/[0-9]+", "/users/0"]]},
+    {"class": "BodyFieldSanitizer", "fields": ["name"], "urls": ["graph.microsoft.com/v1.0/sites"]}
   ],
   "match": {"ignore_body": ["api.example.com/upload/*"], "ignore_body_fields": ["requestId"],
             "allow_playback_repeats": false},
@@ -114,6 +115,7 @@ python -m keboola.vcr.proxy --mode replay --config tests/vcr.json --confdir /vcr
 |---|---|
 | `secret_env` | Env var names whose values (record mode only) are redacted everywhere and checked before writing |
 | `sanitizers` | Sanitizer classes from `keboola.vcr.sanitizers` with their keyword arguments. `DefaultSanitizer` always runs first; declare it at most once to extend it. `CallbackSanitizer` is not available (it needs code) |
+| `sanitizers[].urls` | Optional `host/path` globs: the sanitizer applies only to those requests and their answers (a field that is personal data on one endpoint but needed on others) |
 | `match.body` | `false` turns body matching off |
 | `match.ignore_body` | Extra `host/path` globs whose body is not matched (added to the token endpoint defaults) |
 | `match.ignore_body_fields` | JSON or form fields left out of the body comparison (request ids, timestamps) |
