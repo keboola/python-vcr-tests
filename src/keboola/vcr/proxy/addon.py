@@ -3,6 +3,7 @@
 The test harness switches the active cassette through a small control server (plain HTTP, its own port):
 
 - ``POST /start`` with ``{"cassette": "<absolute path to requests.json>"}`` starts a case.
+- ``GET /status`` reports the active case so far (unmatched requests, recording errors) without ending it.
 - ``POST /stop`` ends it. Record mode writes the cassette. The answer lists unmatched requests (replay).
 - ``GET /health`` answers ``ok`` once the proxy runs (for a compose healthcheck).
 
@@ -93,6 +94,20 @@ class VcrProxyAddon:
             self._session = session
         return {"mode": self.mode, "cassette": str(path), "interactions": len(session.interactions)}
 
+    def status(self) -> dict[str, Any]:
+        """The active case so far, without ending it (a test may run the component more than once per case)."""
+        with self._lock:
+            session = self._session
+            if session is None:
+                return {"mode": self.mode, "active": False, "unmatched": [], "errors": []}
+            return {
+                "mode": self.mode,
+                "active": True,
+                "cassette": str(session.path),
+                "unmatched": list(session.unmatched),
+                "errors": list(session.errors),
+            }
+
     def stop_case(self) -> dict[str, Any]:
         with self._lock:
             session, self._session = self._session, None
@@ -182,6 +197,8 @@ class VcrProxyAddon:
             def do_GET(self) -> None:  # http.server naming
                 if self.path == "/health":
                     self._reply(200, {"status": "ok", "mode": addon.mode})
+                elif self.path == "/status":
+                    self._reply(200, addon.status())
                 else:
                     self._reply(404, {"error": "unknown endpoint"})
 

@@ -406,6 +406,7 @@ def test_mitmproxy_record_then_offline_replay(tmp_path, monkeypatch):
         status, body = replayer.get(url.replace("page=1", "page=2"))
         assert status == 418
         assert b"no recorded interaction matches" in body
+        assert len(replayer.control_call("GET", "/status")["unmatched"]) == 1
         result = replayer.control_call("POST", "/stop")
         assert len(result["unmatched"]) == 1
         assert result["unused"] == 0
