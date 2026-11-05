@@ -279,7 +279,14 @@ class _RecordingCursor:
     def arraysize(self, value: int) -> None:
         self._cursor.arraysize = value
 
+    def _flush(self) -> None:
+        if self._current_entry is not None:
+            self._log.append(self._current_entry)
+            self._current_entry = None
+
     def execute(self, sql: str, parameters: Any = None, **kwargs: Any) -> Any:
+        # Save the previous query's entry first: a cursor can run many queries.
+        self._flush()
         try:
             result = self._cursor.execute(sql, parameters=parameters, **kwargs)
         except Exception as e:
@@ -321,15 +328,11 @@ class _RecordingCursor:
         return rows
 
     def close(self) -> None:
-        if self._current_entry is not None:
-            self._log.append(self._current_entry)
-            self._current_entry = None
+        self._flush()
         self._cursor.close()
 
     def __del__(self) -> None:
-        if self._current_entry is not None:
-            self._log.append(self._current_entry)
-            self._current_entry = None
+        self._flush()
 
     def __enter__(self) -> Self:
         return self
