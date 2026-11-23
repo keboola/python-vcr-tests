@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "vcrpy>=8.3.0,<9",  # floor 8.3.0: 8.2.1 safe-YAML security fix (GHSA-rpj2-4hq8-938g); cassette._save/append are private API we depend on
+    "vcrpy>=8.3.0,<10",  # floor 8.3.0: 8.2.1 safe-YAML security fix (GHSA-rpj2-4hq8-938g); cassette._save/append are private API we depend on
     "freezegun>=1.5.5,<2",
     "typing-extensions>=4; python_version < '3.11'",  # typing.Self backport for db_recorder __enter__ annotations
 ]

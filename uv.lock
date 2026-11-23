@@ -855,7 +855,7 @@ requires-dist = [
     { name = "freezegun", specifier = ">=1.5.5,<2" },
     { name = "mitmproxy", marker = "python_full_version >= '3.12' and extra == 'proxy'", specifier = ">=12.3,<13" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'", specifier = ">=4" },
-    { name = "vcrpy", specifier = ">=8.3.0,<9" },
+    { name = "vcrpy", specifier = ">=8.3.0,<10" },
 ]
 provides-extras = ["proxy"]
 
